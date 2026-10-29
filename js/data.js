@@ -1,0 +1,3709 @@
+/* ==========================================================================
+   BizWeb KH CRM — data.js
+   Data model, localStorage persistence layer, and demo data seeding.
+
+   Entities (mirrors the future Supabase schema so migration is a straight
+   table-for-table swap later):
+     users       - CRM users (Founder / Sales / Partner)
+     leads       - sales leads
+     projects    - confirmed projects (linked back to a lead via leadId)
+     activities  - append-only history of everything that happens
+     followups   - follow-up notes / reschedule log (in addition to activities)
+     payments    - payment records against a project
+
+   Everything is namespaced under BZ_DB_KEY in localStorage as one JSON blob.
+   Each module (leads.js, pipeline.js, projects.js, ...) reads/writes through
+   the DB helper functions below rather than touching localStorage directly,
+   so the storage engine can be swapped for Supabase later without touching
+   the UI modules.
+   ========================================================================== */
+
+const BZ_DB_KEY = 'bizwebkh_crm_db_v1';
+const BZ_SESSION_KEY = 'bizwebkh_crm_session_v1';
+
+/* ---------------------------------------------------------------------- */
+/* Reference / lookup data                                                */
+/* ---------------------------------------------------------------------- */
+
+// Dedicated constant for the "On Hold / Future Follow-up" pipeline stage
+// (CRM feature request) — a valid, still-open opportunity that a client
+// asked to revisit later (next month, after budget approval, etc.). It is
+// deliberately NOT Lost (the opportunity is still real) and NOT Confirmed.
+// Referenced from here instead of repeating the literal string everywhere,
+// so every place that needs to special-case it (the status-change modal's
+// Next Follow-up Date requirement, the Pipeline card's nearest-date sort,
+// the badge color) stays in sync with one source of truth.
+const ON_HOLD_STATUS = 'On Hold / Future Follow-up';
+
+// LEAD / SALES STATUS ONLY — this is the sales pipeline stage of the lead
+// itself and NEVER includes delivery/workflow statuses (those live only on
+// the linked Project's `stage`, see PROJECT_STAGES below). Once a lead
+// reaches Confirmed it stays Confirmed permanently — all further progress
+// (Deposit Paid, In Development, ...) is tracked on the Project record,
+// never by mutating the lead's own status again. See applyProjectStageChange
+// in projects.js, which deliberately does NOT write back to lead.status.
+// "Demo Sent" (its own standalone stage) and "Quotation Sent" have been
+// merged into ONE stage, "Quote and Demo Sent" — every existing lead that
+// was on either of the old stages was migrated to this one in Supabase
+// (see migration migrate_demo_quotation_sent_and_project_code_rules), and
+// neither old wording appears anywhere in the app any more.
+const QUOTE_AND_DEMO_SENT_STATUS = 'Quote and Demo Sent';
+
+// Wording-only rename of the old "Follow-up" pipeline stage — every lead
+// previously on "Follow-up" was migrated to this exact stage in Supabase
+// (see migration rename_followup_to_potential_need_follow_up); the old
+// wording no longer appears anywhere in the app. The stage itself, its
+// position in the pipeline, and all Next Follow-up Date / overdue / due
+// logic are completely unchanged — only the label changed.
+const POTENTIAL_FOLLOWUP_STATUS = 'Potential Need Follow Up';
+
+// EARLY-STAGE statuses — managed entirely in Lead Records, never shown as
+// Pipeline columns (see the sales-restructure task). A lead sits here
+// until a Founder/Admin explicitly moves it into Pipeline via
+// "Add to Pipeline" (pipeline.js openAddToPipelineModal), which assigns a
+// Project Code and advances status straight to QUOTE_AND_DEMO_SENT_STATUS
+// on this SAME lead record — no new lead or duplicate is ever created.
+const EARLY_LEAD_STATUSES = ['New Lead', 'Contacted', 'Qualified'];
+
+const LEAD_STATUSES = [
+  ...EARLY_LEAD_STATUSES, QUOTE_AND_DEMO_SENT_STATUS,
+  POTENTIAL_FOLLOWUP_STATUS, ON_HOLD_STATUS, 'Negotiation', 'Confirmed', 'Lost'
+];
+
+// Root-cause fix (CRM – Investigate Confirmed/Won Pipeline Not Creating
+// Project, C060): the Add Lead form used to let staff pick ANY status —
+// including 'Confirmed' — as a brand-new lead's starting status. Every
+// other path into 'Confirmed' goes through applyLeadStatusChange(), which
+// special-cases 'Confirmed' to open openConfirmProjectModal() and reliably
+// auto-create (or safely reuse) the linked Project. Creating a lead that is
+// already 'Confirmed' from the very first save skipped that flow entirely,
+// so its Project was silently never created — exactly what happened to
+// lead L053 / Project C060. A brand-new lead can therefore never start
+// life already 'Confirmed' — it must always reach that status via the
+// normal, logged status-change flow. Deliberately scoped to 'Confirmed'
+// only (the actual reported bug) — every other status, including 'Lost',
+// is left exactly as selectable as before.
+const NEW_LEAD_CREATION_STATUSES = LEAD_STATUSES.filter(s=> s!=='Confirmed');
+
+// Statuses that belong on the Kanban pipeline board. Pipeline now starts
+// from Quote and Demo Sent onward — New Lead / Contacted / Qualified are
+// deliberately NOT here: they are early-stage prospects, managed only in
+// Lead Records, and never rendered as Pipeline columns. This is a pure
+// UI/filtering change (see EARLY_LEAD_STATUSES above) — those statuses are
+// still valid values on LEAD_STATUSES and in the database; nothing about
+// existing leads or their data changes, they simply stop being rendered
+// on the Pipeline board until a Founder/Admin explicitly advances one.
+const PIPELINE_STATUSES = [
+  QUOTE_AND_DEMO_SENT_STATUS,
+  POTENTIAL_FOLLOWUP_STATUS, ON_HOLD_STATUS, 'Negotiation', 'Confirmed'
+];
+
+// TRUE open opportunities — used for Pipeline Value everywhere (dashboard
+// KPI + Pipeline Value by Industry chart + Sales Performance). Deliberately
+// excludes Confirmed (it becomes a Project and is counted in Closed Sales
+// instead) and Lost — so a lead is never counted in both Pipeline Value and
+// Closed Sales at once. On Hold / Future Follow-up stays IN this list — it's
+// still a real, active, open opportunity (just temporarily paused), so it
+// must keep counting toward Pipeline Value everywhere that reads this
+// list, exactly like every other open Pipeline stage. Early-stage leads
+// (New Lead / Contacted / Qualified) are intentionally excluded — Pipeline
+// Value now reflects ONLY opportunities that actually appear in Pipeline.
+const OPEN_PIPELINE_STATUSES = [
+  QUOTE_AND_DEMO_SENT_STATUS,
+  POTENTIAL_FOLLOWUP_STATUS, ON_HOLD_STATUS, 'Negotiation'
+];
+
+// Project Code business rule: NOT required for New Lead / Contacted /
+// Qualified, becomes REQUIRED the first time a lead reaches Quote and Demo
+// Sent (or any stage after it) and doesn't already have one. Confirmed is
+// deliberately excluded here — it never reaches the generic status-change
+// modal (see applyLeadStatusChange in leads.js, which redirects Confirmed
+// to the dedicated openConfirmProjectModal flow instead), and Lost is
+// excluded because abandoning a lead should never be blocked on a Project
+// Code it may never have needed.
+function leadStatusRequiresProjectCode(status){
+  if(status==='Lost' || status==='Confirmed') return false;
+  const gateIdx = LEAD_STATUSES.indexOf(QUOTE_AND_DEMO_SENT_STATUS);
+  const idx = LEAD_STATUSES.indexOf(status);
+  return idx>=0 && idx>=gateIdx;
+}
+
+// DISPLAY-LABEL-ONLY rename layer (pipeline stage relabel task). The
+// internal stored/compared values above (QUOTE_AND_DEMO_SENT_STATUS,
+// POTENTIAL_FOLLOWUP_STATUS, the literal 'Confirmed' LEAD status) are
+// UNCHANGED — every lead record, filter, comparison (`status===...`) and
+// <option value="..."> keeps using these exact original strings forever.
+// Only what the UI *displays* for a lead's pipeline stage changes, via this
+// lookup. ON_HOLD_STATUS and 'Negotiation' are deliberately absent — their
+// displayed wording is unchanged, so they fall through to the identity
+// default below.
+//
+// IMPORTANT: 'Confirmed' is also used, as the exact same literal string,
+// for Project.stage (delivery workflow) and per-function status
+// (FUNCTION_STATUSES / DEFAULT_FUNCTION_STATUS) — those are a DIFFERENT
+// concept from the lead's pipeline stage and are OUT OF SCOPE for this
+// relabel. This map/helper must therefore only ever be applied where the
+// value being displayed is known to be a LEAD's pipeline stage — never
+// generically to every 'Confirmed' string in the app (see statusBadge()'s
+// optional displayText override in app.js, and each call site below).
+const PIPELINE_STAGE_DISPLAY_LABELS = {
+  [QUOTE_AND_DEMO_SENT_STATUS]: 'Awaiting Client Feedback',
+  [POTENTIAL_FOLLOWUP_STATUS]: 'Follow-Up / Interested',
+  'Confirmed': 'Confirmed / Won'
+};
+function pipelineStageLabel(status){
+  return PIPELINE_STAGE_DISPLAY_LABELS[status] || status;
+}
+
+// PROJECT / DELIVERY STATUS ONLY — completely separate axis from lead
+// status. A project always starts at Confirmed and can move forward through
+// delivery, or sideways into On Hold / Cancelled.
+const PROJECT_STAGES = [
+  'Confirmed', 'Deposit Paid', 'In Development',
+  'Final Payment Pending', 'Completed', 'On Hold', 'Cancelled'
+];
+// Stages that still count as "active" work (used for KPIs / attention lists)
+const ACTIVE_PROJECT_STAGES = [
+  'Confirmed', 'Deposit Paid', 'In Development', 'Final Payment Pending'
+];
+
+const LEAD_SOURCES = [
+  'Facebook Ads', 'Facebook Page', 'Telegram', 'Referral', 'Existing Client',
+  'Website', 'Direct', 'Partner', 'Other'
+];
+
+// Standardized Industry / SME Type — the SAME list is used everywhere
+// (Leads, Pipeline, Projects, Dashboard charts) so values never fragment
+// into incompatible per-page categories.
+const INDUSTRIES = [
+  'School / Education', 'Clinic / Healthcare', 'Salon / Beauty', 'Retail / E-Commerce',
+  'Hotel / Resort / Guesthouse', 'Restaurant / Cafe', 'Real Estate / Property',
+  'NGO / Association', 'Professional Services', 'Logistics / Delivery',
+  'Construction / Property Development', 'Insurance / Finance', 'Pharmacy', 'Other'
+];
+// Back-compat alias — older demo data / code referred to this as BUSINESS_TYPES.
+const BUSINESS_TYPES = INDUSTRIES;
+// Display fallback — an empty/unknown industry is shown as "Unspecified",
+// never silently lumped into "Other" (which is itself a real, selectable
+// industry value and must stay distinct from "we don't know").
+function industryLabel(industry){ return (industry && String(industry).trim()) ? industry : 'Unspecified'; }
+
+// Standardized Project Type — these are INTERNAL IDs (the literal values
+// stored in Supabase as leads.interested_service / projects.project_type,
+// and matched against SERVICE_PRICE_LIST[].projectType), NOT necessarily
+// what's shown to the user. 'Customer Management System' in particular is
+// kept exactly as-is here on purpose (CRM rename, spec §3/§13): it remains
+// the stored/matched value for every existing lead, project and quotation
+// already linked to that package, so nothing already in Supabase silently
+// disconnects from its package. The current DISPLAY name for any of these
+// IDs comes from serviceDisplayName()/serviceShortName() below, never from
+// this array directly — anywhere this list renders as dropdown options,
+// wrap the label (not the value) in serviceDisplayName().
+const SERVICE_TYPES = [
+  'Starter Website', 'Pro Website', 'Pro Max Website', 'Dynamic Website / CMS',
+  'Booking System', 'Customer Management System',
+  'E-Commerce Level 1', 'E-Commerce Level 2', 'E-Commerce Level 3', 'E-Commerce Level 4',
+  'Custom Business System', 'Mobile App / Advanced Platform', 'Other'
+];
+
+const LOST_REASONS = [
+  'Price', 'No Response', 'Postponed', 'Competitor', 'No Budget',
+  'No Longer Needed', 'Other'
+];
+
+const PAYMENT_STATUSES = ['Not Paid', 'Partially Paid', 'Fully Paid'];
+// Primary, spec-facing list for NEW payment entry (Record Payment / Record
+// Receipt modals, filters). 'Wing' is intentionally NOT listed here (no
+// existing payment uses it) but stays a legal value at the DB level — see
+// PAYMENT_METHODS_ALL for any surface that must stay backward-compatible
+// with legacy/edited records.
+const PAYMENT_METHODS = ['ABA Transfer', 'KHQR', 'Cash', 'Bank Transfer', 'Other'];
+// Superset used by the Edit Payment dropdown and the Receipts filter —
+// never drops a value a real record could already hold.
+const PAYMENT_METHODS_ALL = ['ABA Transfer', 'KHQR', 'Cash', 'Bank Transfer', 'Wing', 'Other'];
+// Payment TYPE describes what a single ledger entry was for. Payment STATUS
+// (above) is never stored — it's always derived live from the ledger, see
+// paymentSummaryFor() below.
+// Primary, spec-facing list for NEW payment entry (Record Payment / Record
+// Receipt modals). 'Partial Payment'/'Full Payment' are intentionally NOT
+// listed here going forward but stay legal DB values — 5 real historical
+// payments use them; see PAYMENT_TYPES_ALL for any surface that must stay
+// backward-compatible with those records.
+const PAYMENT_TYPES = ['Deposit', 'Milestone', 'Final Payment', 'Renewal', 'Add-on', 'Other'];
+// Superset used by the Edit Payment dropdown and the Receipts filter —
+// never drops a value a real record could already hold.
+const PAYMENT_TYPES_ALL = ['Deposit', 'Partial Payment', 'Full Payment', 'Milestone', 'Final Payment', 'Renewal', 'Add-on', 'Other'];
+
+// Receipt status — deliberately NOT the same as Payment Status (Not Paid/
+// Partially Paid/Fully Paid, a project/invoice-level concept derived from
+// the ledger) or Invoice Status. A receipt is simply "Issued" until someone
+// explicitly cancels it (Founder/Admin only — see canCancelReceipt() in
+// receipts.js); never any other value.
+const RECEIPT_STATUSES = ['Issued', 'Cancelled'];
+
+// Status of an individual confirmed function / scope item inside a project.
+const FUNCTION_STATUSES = ['Confirmed', 'In Development', 'Completed', 'Future / Phase 2'];
+const DEFAULT_FUNCTION_STATUS = 'Confirmed';
+
+// A few starter module templates so "+ Add Module" isn't a blank slate —
+// purely a UI convenience, never enforced (projects are free-form).
+const FUNCTION_MODULE_TEMPLATES = {
+  'Website': ['Home', 'About', 'Services', 'Products', 'Contact', 'Khmer / English'],
+  'Booking System': ['Customer Booking Form', 'Date & Time Selection', 'Booking Status', 'Admin Booking Management'],
+  'CMS': ['Admin Content Editor', 'Media Library', 'Page Management'],
+  'Customer Management': ['Customer Records', 'Status Tracking', 'Reports'],
+  'CRM': ['Customer Records', 'Customer History', 'Customer Type / VIP', 'Package / Balance Management', 'Transactions', 'Staff Incentive / Commission', 'Reports', 'Business Dashboard'],
+  'E-Commerce': ['Product Catalog', 'Shopping Cart', 'Checkout', 'Order Management'],
+  'Admin Dashboard': ['Booking List', 'Calendar', 'Customer Records', 'Reports'],
+  'Mobile App': ['iOS App', 'Android App', 'Push Notifications'],
+};
+
+// 'Quotation Sent' here describes a DIFFERENT thing from the "Quote and
+// Demo Sent" LEAD STATUS above — it's logged by the Quotations module
+// (quotations.js markAsSent()) when an actual quotation DOCUMENT is
+// marked sent to the client, an event on the Quotation's own quotationStatus
+// axis ('Draft' -> ... -> 'Sent to Client'), independent of the lead's
+// pipeline stage. It is intentionally left as-is: renaming it to "Quote and
+// Demo Sent" would misdescribe every one of these historical (and future)
+// activity records as if a demo had been sent too, which this event never
+// claims. 'Demo Sent' (the old activity type, distinct from the old LEAD
+// STATUS of the same name) is removed below — it was never actually logged
+// anywhere in the app (dead/unused), so nothing is lost.
+const ACTIVITY_TYPES = [
+  'Lead Created', 'Lead Edited', 'Status Changed', 'Follow-up Added', 'Follow-up Completed',
+  'Follow-up Rescheduled', 'Quotation Sent', 'Assigned Sales Changed', 'Deposit Recorded',
+  'Payment Recorded', 'Project Stage Changed', 'Project Created', 'Note Added',
+  'Lead Lost', 'Function Added', 'Function Changed', 'Function Removed',
+  'Quotation Created', 'Quotation Edited', 'Submitted for Review',
+  'Founder Approved', 'Founder Rejected', 'Quotation Accepted', 'Quotation Expired',
+  'Data Imported', 'Lead Archived', 'Lead Restored', 'Lead Deleted',
+  'Payment Updated', 'Payment Voided', 'Project Value Changed',
+  'Follow-up Scheduled', 'Follow-up Cancelled',
+  'Project Code Assigned', 'Project Code Changed', 'Lead Added to Pipeline',
+  // Quotations MVP (spec §26) — the 9 required quotation event types.
+  // 'Quotation Created', 'Quotation Sent', 'Quotation Accepted' and
+  // 'Quotation Expired' already existed above and are reused as-is.
+  'Quotation Updated', 'Quotation Submitted for Approval', 'Quotation Approved',
+  'Quotation Rejected', 'Quotation Superseded', 'Quotation Converted to Project',
+  // Users & Roles Management (Settings -> Users & Roles) — logged
+  // server-side by the staff-manage Edge Function, never by the client.
+  'User Invited', 'Invitation Resent', 'User Role Changed',
+  'User Deactivated', 'User Reactivated', 'Password Reset Requested',
+  // Receipts module — logged client-side by js/receipts.js.
+  'Receipt Generated', 'Receipt Reissued', 'Receipt Cancelled',
+  // Payment/Invoice refinements (Payment <-> Invoice relinking, Founder/
+  // Admin only) — logged client-side by relinkPaymentInvoice() in
+  // js/payments.js.
+  'Payment Invoice Link Updated'
+];
+
+/* ---------------------------------------------------------------------- */
+/* Service Price List — the SINGLE pricing reference used everywhere in    */
+/* the demo (Quotations, and the demo lead/project generator below). Each  */
+/* entry maps to an existing SERVICE_TYPES string via `projectType` so no  */
+/* other list in the app needs to be renamed or duplicated.                */
+/* ---------------------------------------------------------------------- */
+
+// 8-state MVP lifecycle (Quotations spec). "Superseded" is set automatically
+// on the OLD row the moment an already-Sent-or-later quotation is edited and
+// saved as a new revision (see saveQuotationFromState) — it is never chosen
+// directly by a user. "Expired" is likewise never chosen directly; it's
+// calculated from validUntil (see isQuotationExpired) for display, and can
+// also be set explicitly by Founder/Admin for a quotation that's gone stale.
+const QUOTATION_STATUSES = [
+  'Draft', 'Awaiting Approval', 'Approved', 'Sent',
+  'Accepted', 'Rejected', 'Expired', 'Superseded'
+];
+// Statuses that still count as "live" on the list/summary cards — a
+// Superseded row is historical only (reachable from its newer revision's
+// "Version History", never shown in the main list or counted in totals).
+const QUOTATION_LIVE_STATUSES = QUOTATION_STATUSES.filter(s=>s!=='Superseded');
+const APPROVAL_STATUSES = [
+  'Sales Approved', 'Founder Review Required', 'Founder Approved', 'Founder Rejected'
+];
+// A quotation is visually/operationally "Expired" once its Valid Until date
+// has passed, UNLESS it has already reached a terminal state (Accepted/
+// Rejected/Superseded) or is still a Draft (a draft with no send date yet
+// shouldn't nag as expired). This is computed, never stored as the literal
+// status unless a user explicitly marks it Expired.
+function isQuotationExpired(q){
+  if(!q || !q.validUntil) return false;
+  if(['Accepted','Rejected','Superseded','Draft'].includes(q.status)) return false;
+  return isPastLocalDate(q.validUntil);
+}
+function quotationDisplayStatus(q){
+  return isQuotationExpired(q) ? 'Expired' : q.status;
+}
+
+// Root-cause fix (BizWeb CRM -- Replace Founder Review with Configurable
+// Package Add-On Pricing, 2026-10-02 approval): every function/add-on now
+// carries an explicit `priceType` instead of a founder-review flag --
+//   'included' -- bundled into the base package, always $0, not priced
+//   'fixed'    -- a predefined amount (Founder/Admin-editable in Settings
+//                 -> Quotations / Service Price List, never hardcoded
+//                 again once read from there)
+//   'manual'   -- the quotation creator enters the agreed amount (agreed
+//                 with Founder/client over Telegram, per the new process)
+// `editableOnQuotation` controls whether Sales can type/override the
+// amount directly on a specific quotation (always true for 'manual';
+// defaults to false for 'fixed' unless a package explicitly opts in).
+// `defaultSelected` controls whether the add-on starts checked when the
+// package is first picked. There is deliberately NO founder-review /
+// approval field anywhere in this shape -- a function no longer blocks
+// the WHOLE quotation; at most, an unresolved 'manual' item keeps ITSELF
+// (and therefore the aggregate Year 1 Total) showing as TBC until priced.
+function svcFn(name, opts={}){
+  const priceType = opts.priceType || 'included';
+  return {
+    id: fnId(), name, priceType,
+    defaultPrice: priceType==='included' ? 0 : (opts.defaultPrice===undefined ? null : opts.defaultPrice),
+    defaultSelected: opts.defaultSelected!==false,
+    editableOnQuotation: opts.editableOnQuotation!==undefined ? !!opts.editableOnQuotation : (priceType==='manual'),
+    salesCanQuote: opts.salesCanQuote!==false,
+  };
+}
+// Looks up a definition from the SHARED catalog below and spreads it into
+// a specific package's own functions[] array -- so a reusable add-on
+// (Payment/KHQR, OTP, multi-branch, API integration, etc., req #4: "Do not
+// duplicate pricing logic unnecessarily") is defined ONCE in
+// ADDITIONAL_FUNCTIONS_CATALOG and every package that offers it just
+// references that id, instead of re-typing its own copy of the name/price/
+// priceType. `overrides` lets one package rename or re-tune a shared
+// add-on (e.g. a different defaultSelected) without forking its base
+// definition for every other package that also uses it.
+function sharedAddon(afId, overrides={}){
+  const base = ADDITIONAL_FUNCTIONS_CATALOG.find(a=>a.id===afId);
+  if(!base) throw new Error('sharedAddon: unknown shared add-on id "'+afId+'"');
+  return svcFn(overrides.name || base.name, {
+    priceType: overrides.priceType || base.priceType,
+    defaultPrice: overrides.defaultPrice!==undefined ? overrides.defaultPrice : base.defaultPrice,
+    defaultSelected: overrides.defaultSelected!==undefined ? overrides.defaultSelected : false,
+    editableOnQuotation: overrides.editableOnQuotation!==undefined ? overrides.editableOnQuotation : undefined,
+    salesCanQuote: base.salesCanQuote,
+  });
+}
+
+/* ---------------------------------------------------------------------- */
+/* Package scope wording — APPROVED FINAL (BizWeb_KH_Service_Package_      */
+/* Master_APPROVED_FINAL.xlsx, "APPROVED FINAL" sheet, approved 2026-09-13)*/
+/* is the single source of truth for every package's default scope         */
+/* wording below. Two structural rules apply to EVERY package:             */
+/*   1) Domain and Hosting are always two separate scope lines — never     */
+/*      combined into one "hosting & domain" bullet (Starter's old wording */
+/*      literally called single-page SECTIONS separate "pages", which is   */
+/*      the bug this whole approval process started from).                */
+/*   2) These are purely informational scope-item TEXT — the ACTUAL Year 1 */
+/*      domain/hosting Included-vs-Separate calculation and dollar amounts */
+/*      already live entirely in the separate Annual Cost Breakdown        */
+/*      (annualCost.year1.domainMode/hostingIncluded, see                  */
+/*      normalizeAnnualCost() in quotations.js) — changing this wording    */
+/*      has ZERO effect on any total, payment schedule, or calculation.    */
+/* ---------------------------------------------------------------------- */
+const KHMER_ENGLISH_SCOPE_ITEM = 'Khmer / English (client supplies final content/translations)';
+// `year2Price`/`year3Price` below (Settings -> Service Price List, Founder-
+// editable) are now aligned to the SAME APPROVED FINAL renewal figures as
+// RENEWAL_DEFAULTS in defaultAnnualCostForService() (2026-09-13 approval,
+// item 3: "I do not want the CRM to contain two conflicting renewal
+// reference systems"). This is a REFERENCE TABLE ONLY — it is never read by
+// any quotation/annual-cost calculation (RENEWAL_DEFAULTS is the sole
+// source consumed there); it only feeds the Settings display/edit table
+// (settingsPricesTab() in app.js) and its own Supabase columns
+// (year2_price/year3_price, both nullable numeric). Changing it therefore
+// cannot affect any already-saved quotation's stored values in any way.
+// The 4 "To be confirmed" packages (E-Commerce L3/L4, Custom Business
+// System, Mobile App) use `null` rather than inventing a numeric renewal —
+// the DB columns are nullable, and settingsPricesTab() renders a null value
+// as a plain "To be confirmed" label instead of a $ figure/input, with no
+// change to the table's columns/layout.
+// Additional functions catalog — reusable add-ons that can be added to ANY
+// quotation regardless of the base package (req #4, "BizWeb CRM -- Replace
+// Founder Review with Configurable Package Add-On Pricing", 2026-10-02:
+// "Some functions should be reusable across several packages... Do not
+// duplicate pricing logic unnecessarily"). Declared BEFORE SERVICE_PRICE_LIST
+// so sharedAddon() can reference it while packages' own functions[] arrays
+// are being built.
+// Catalog item ids are internal-only (never stored on a saved quotation's
+// items — each added item gets its own fresh id at add-time, see
+// openAddQuotationFunctionModal() in quotations.js, or at sharedAddon()
+// time), so renaming/renumbering/removing entries here never affects any
+// already-saved quotation.
+// 'fixed' entries carry a real predefined amount, Founder/Admin-editable
+// from Settings -> Quotations / Service Price List (never hardcoded
+// business pricing beyond this one catalog + each package's own base
+// price). 'manual' entries have no predefined amount — the quotation
+// creator enters the figure agreed with Founder/client (over Telegram,
+// per the new process), and that single item (never the whole quotation)
+// shows as TBC until an amount is entered.
+const ADDITIONAL_FUNCTIONS_CATALOG = [
+  // ----- Fixed-price standard add-ons -----
+  { id:'AF01', name:'Additional informational page', priceType:'fixed', salesCanQuote:true, defaultPrice:20 },
+  { id:'AF02b', name:'Additional section', priceType:'fixed', salesCanQuote:true, defaultPrice:10 },
+  { id:'AF02', name:'Contact / inquiry form', priceType:'fixed', salesCanQuote:true, defaultPrice:0 },
+  { id:'AF03', name:'Standard CMS (content editor)', priceType:'fixed', salesCanQuote:true, defaultPrice:80 },
+  { id:'AF04', name:'Basic booking form', priceType:'fixed', salesCanQuote:true, defaultPrice:100 },
+  { id:'AF05', name:'Standard customer management', priceType:'fixed', salesCanQuote:true, defaultPrice:100 },
+  { id:'AF06', name:'Product catalog + chat ordering', priceType:'fixed', salesCanQuote:true, defaultPrice:80 },
+  { id:'AF07', name:'Standard E-Commerce Level 2 workflow', priceType:'fixed', salesCanQuote:true, defaultPrice:150 },
+  { id:'AF30', name:'Search / filter', priceType:'fixed', salesCanQuote:true, defaultPrice:0 },
+  { id:'AF34', name:'Additional third language', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF31', name:'Telegram / WhatsApp inquiry', priceType:'fixed', salesCanQuote:true, defaultPrice:0 },
+  // ----- Manual / agreed-with-Founder add-ons -----
+  { id:'AF32', name:'Additional storage / bandwidth / heavy server usage', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF08', name:'Online payment gateway integration', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF33', name:'Dynamic KHQR', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF09', name:'OTP / SMS / email verification', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF11', name:'Customer login / account / membership', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF12', name:'Inventory management', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF13', name:'POS system / integration', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF14', name:'Accounting integration', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF15', name:'Payroll module', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF16', name:'Multi-branch / multi-warehouse', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF17', name:'Advanced roles / permissions / extra user roles', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF18', name:'Approval workflow', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF19', name:'API / third-party / delivery integration', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF21', name:'Large data import / migration (500+ records or heavy data)', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF22', name:'Custom reports / analytics', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF23', name:'Customized loyalty / membership program', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF24', name:'Customized delivery fee / rules', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF25', name:'Marketplace sync / integration', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF26', name:'Return / refund workflow (advanced)', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF27', name:'Wallet system', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF28', name:'Advanced inventory / stock management', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF29', name:'ERP integration', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF35', name:'Promotions / coupons', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF36', name:'Advanced order status workflow', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF37', name:'Automation', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  { id:'AF38', name:'Subscription / recurring billing', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+  // Business Email Setup (task: "BizWeb CRM -- Add Business Email Setup as
+  // Quotation Add-On", 2026-10-04). priceType:'fixed' with a real default
+  // price ($30, Founder/Admin-editable in Settings -> Quotations / Service
+  // Price List per package once synced -- never hardcoded a second place).
+  // The full client-facing scope -- what's included, and the explicit
+  // exclusions (mailbox migration, recovery of an existing/broken system,
+  // Google Workspace / Microsoft 365 administration, advanced routing/
+  // groups, large historical migration, and the fact that hosting/provider
+  // subscription + renewal are separate, at provider cost) -- lives in this
+  // ONE name string, since that's the only field rendered everywhere this
+  // item appears (item editor, quotation detail modal, printed quotation
+  // Scope of Work). editableOnQuotation:true is passed as an explicit
+  // override at every sharedAddon('AF39', ...) call site below (a 'fixed'
+  // item defaults to NOT editable, same as every other fixed add-on in
+  // this catalog -- this one is deliberately the exception, per spec).
+  { id:'AF39', name:"Business Email Setup \u2013 up to 3 mailboxes on the client's domain, including standard DNS/MX and SPF/DKIM/DMARC configuration where supported, plus basic webmail/email-client setup guidance. Email hosting/provider subscription and annual renewal are separate, billed at provider actual cost. Excludes mailbox migration, recovery/troubleshooting of an existing broken email system, Google Workspace or Microsoft 365 administration, advanced routing/groups, and large historical email migration (quoted separately).", priceType:'fixed', salesCanQuote:true, defaultPrice:30 },
+  // Additional Business Email Mailbox -- the quotation item architecture
+  // has no quantity field on a scope item (confirmed: no qty/quantity
+  // concept anywhere in quotations.js/data.js), so per the task's own
+  // fallback instruction this stays a single MANUAL-price add-on rather
+  // than building a new quantity system just for this: the quotation
+  // creator totals the extra mailboxes needed x the $5 reference rate and
+  // enters that single agreed amount. priceType:'manual' already defaults
+  // editableOnQuotation to true (same as every other manual item), so no
+  // override is needed at its sharedAddon() call sites.
+  { id:'AF40', name:'Additional Business Email Mailbox \u2014 beyond the 3 included with Business Email Setup (reference $5 per extra mailbox; enter the total agreed amount)', priceType:'manual', salesCanQuote:true, defaultPrice:null },
+];
+
+const SERVICE_PRICE_LIST = [
+  { id:'SVC01', name:'Starter Website', projectType:'Starter Website', category:'Website', basePrice:99, year2Price:45, year3Price:45,
+    salesCanQuote:true, maxDiscountPct:10, defaultDelivery:'7 days', status:'Active',
+    functions:[ svcFn('Single-page website with multiple sections (Home, About, Services, Gallery/Contact)'),
+                svcFn(KHMER_ENGLISH_SCOPE_ITEM), svcFn('Responsive desktop/mobile design'), svcFn('Basic SEO setup'),
+                svcFn('Year 1 Hosting'), svcFn('Domain — Included in Year 1 (or Charged Separately / Client Already Owns Domain, per quotation)'),
+                sharedAddon('AF39', {editableOnQuotation:true}),
+                sharedAddon('AF40'),
+            ] },
+  { id:'SVC02', name:'Pro Website', projectType:'Pro Website', category:'Website', basePrice:199, year2Price:60, year3Price:60,
+    salesCanQuote:true, maxDiscountPct:10, defaultDelivery:'10 days', status:'Active',
+    functions:[ svcFn('Multi-page website — up to 5 pages (e.g. Home, About, Services, Gallery/Projects, Contact)'),
+                svcFn(KHMER_ENGLISH_SCOPE_ITEM), svcFn('Responsive desktop/mobile design'), svcFn('Basic SEO setup'),
+                svcFn('Year 1 Hosting'), svcFn('Domain — Included in Year 1 (or Charged Separately / Client Already Owns Domain, per quotation)'),
+                sharedAddon('AF39', {editableOnQuotation:true}),
+                sharedAddon('AF40'),
+            ] },
+  { id:'SVC03', name:'Pro Max Website', projectType:'Pro Max Website', category:'Website', basePrice:299, year2Price:75, year3Price:75,
+    salesCanQuote:true, maxDiscountPct:10, defaultDelivery:'14 days', status:'Active',
+    functions:[ svcFn('Multi-page website — up to 8 pages, with enhanced sections and static News/Blog-style content where required'),
+                svcFn(KHMER_ENGLISH_SCOPE_ITEM), svcFn('Responsive desktop/mobile design'), svcFn('Basic SEO setup'),
+                svcFn('Year 1 Hosting'), svcFn('Domain — Included in Year 1 (or Charged Separately / Client Already Owns Domain, per quotation)'),
+                sharedAddon('AF39', {editableOnQuotation:true}),
+                sharedAddon('AF40'),
+            ] },
+  { id:'SVC04', name:'Dynamic Website + CMS', projectType:'Dynamic Website / CMS', category:'CMS', basePrice:399, year2Price:120, year3Price:120,
+    salesCanQuote:true, maxDiscountPct:10, defaultDelivery:'14 days', status:'Active',
+    functions:[ svcFn('Up to 5 core public pages'), svcFn('Secure CMS / Admin Dashboard'), svcFn('Database / backend'),
+                svcFn('Agreed editable modules (e.g. Services, News, Projects, Gallery, Team) per client scope'),
+                svcFn(KHMER_ENGLISH_SCOPE_ITEM),
+                svcFn('Year 1 Hosting / Backend / Database'), svcFn('Domain — Included in Year 1 (or Charged Separately / Client Already Owns Domain, per quotation)'),
+                sharedAddon('AF39', {editableOnQuotation:true}),
+                sharedAddon('AF40'),
+            ] },
+  { id:'SVC05', name:'Booking Website + Admin', projectType:'Booking System', category:'Booking', basePrice:499, year2Price:150, year3Price:150,
+    salesCanQuote:true, maxDiscountPct:10, defaultDelivery:'18 days', status:'Active',
+    functions:[ svcFn('Up to 5 core public pages'), svcFn('Booking form'), svcFn('Date/time selection'), svcFn('Customer information'),
+                svcFn('Basic admin dashboard'), svcFn('Booking list'), svcFn('Calendar'), svcFn('Booking status'),
+                svcFn('Year 1 Hosting / Backend / Database'), svcFn('Domain — Included in Year 1 (or Charged Separately / Client Already Owns Domain, per quotation)'),
+                sharedAddon('AF39', {editableOnQuotation:true}),
+                sharedAddon('AF40'),
+            ] },
+  /* Renamed from "Customer Management System" to proper CRM terminology
+     (CRM = Customer Relationship Management, a distinct product from CMS =
+     Content Management System — SVC04 above). `name` is the full display
+     name (Service Price List, package dropdown); `shortName` is used only
+     where space is limited (e.g. the auto-generated scope base-item label).
+     `projectType` — the internal ID matched against every existing lead/
+     project/quotation already linked to this package — is deliberately
+     UNCHANGED, so nothing already in Supabase disconnects from its
+     package (spec §3: "Do NOT change existing IDs/database relationships
+     unnecessarily"). `category` changed from 'CMS' to 'CRM' so this
+     package's auto-generated scope items are never grouped/labelled under
+     the same "CMS" module as the actual $399 CMS package (SVC04) — CMS
+     and CRM must remain visually distinct everywhere, including on the
+     quotation's own scope table (spec: "They must remain two different
+     products"). */
+  { id:'SVC06', name:'CRM – Customer Relationship Management', shortName:'CRM System', projectType:'Customer Management System', category:'CRM', basePrice:599, year2Price:180, year3Price:180,
+    salesCanQuote:true, maxDiscountPct:10, defaultDelivery:'21 days', status:'Active',
+    functions:[ svcFn('Customer records'), svcFn('Customer history'), svcFn('Customer type / VIP management'), svcFn('Package / balance management'),
+                svcFn('Transactions'), svcFn('Staff incentive / commission'), svcFn('Reports'), svcFn('Business dashboard'),
+                svcFn('Year 1 Hosting / Backend / Database'),
+                svcFn('Domain — Included in Year 1 if a public domain/entry point is needed (or Charged Separately / Client Owns Domain), per quotation') ] },
+  { id:'SVC07', name:'E-Commerce Level 1 – Basic Catalog + Admin', projectType:'E-Commerce Level 1', category:'E-Commerce', basePrice:500, year2Price:150, year3Price:150,
+    salesCanQuote:true, maxDiscountPct:10, defaultDelivery:'21 days', status:'Active',
+    functions:[ svcFn('Product catalog'), svcFn('Product admin dashboard'), svcFn('Search / filter (where agreed in scope)'),
+                svcFn('Order/inquiry redirect to Telegram / Facebook / WhatsApp'),
+                svcFn('Year 1 Hosting / Backend / Database'), svcFn('Domain — Included in Year 1 (or Charged Separately / Client Already Owns Domain, per quotation)'),
+                sharedAddon('AF39', {editableOnQuotation:true}),
+                sharedAddon('AF40'),
+            ] },
+  { id:'SVC08', name:'E-Commerce Level 2 – Standard Online Store', projectType:'E-Commerce Level 2', category:'E-Commerce', basePrice:1199, year2Price:240, year3Price:240,
+    salesCanQuote:true, maxDiscountPct:10, defaultDelivery:'30 days', status:'Active', priceIsStartingFrom:true,
+    functions:[ svcFn('Product catalog'), svcFn('Shopping cart'), svcFn('Checkout'),
+                svcFn('Payment method: to be explicitly confirmed with client (e.g. COD, Manual KHQR, Bank Transfer, or Online Gateway)'),
+                svcFn('Standard customer login'), svcFn('Order management'),
+                svcFn('Year 1 Hosting / Backend / Database'), svcFn('Domain — Included in Year 1 (or Charged Separately / Client Already Owns Domain, per quotation)'),
+                sharedAddon('AF39', {editableOnQuotation:true}),
+                sharedAddon('AF40'),
+            ] },
+  // Root-cause fix (BizWeb CRM -- Replace Founder Review with Configurable
+  // Package Add-On Pricing, 2026-10-02 approval): SVC09-SVC12 below no
+  // longer gate pricing on founderReviewRequired/salesCanQuote at all --
+  // Sales can now build ANY of these quotations directly. Base package
+  // scope stays `included` ($0, bundled into basePrice); everything the
+  // Sales & Product Package Guide (Aug 2026 training version) lists as a
+  // candidate add-on for that package is now an explicit, selectable
+  // function with its own priceType -- 'fixed' where the Guide gives a
+  // firm figure, 'manual' where it says "Check Founder" / scope varies.
+  // Shared add-ons (reused across several packages, req #4) reference the
+  // ONE definition in ADDITIONAL_FUNCTIONS_CATALOG via sharedAddon() --
+  // editing that catalog entry's price in Settings updates every package
+  // that uses it, nothing is retyped per package.
+  { id:'SVC09', name:'E-Commerce Level 3 – Customized Commerce', projectType:'E-Commerce Level 3', category:'E-Commerce', basePrice:1500, year2Price:240, year3Price:300,
+    salesCanQuote:false, maxDiscountPct:0, defaultDelivery:'25-40 days', status:'Active', priceIsStartingFrom:true,
+    functions:[
+      svcFn('Product catalog'), svcFn('Shopping cart'), svcFn('Checkout'),
+      svcFn('Year 1 Hosting / Backend / Database'),
+      svcFn('Domain — Included in Year 1 (or Charged Separately / Client Already Owns Domain, per quotation)'),
+      // Candidate add-ons (Package Guide, E-Commerce Level 3 scope):
+      svcFn('Customized checkout flow', {priceType:'manual', defaultSelected:false}),
+      sharedAddon('AF23', {name:'Customized loyalty rules'}),
+      sharedAddon('AF35', {name:'Promotions / coupons'}),
+      sharedAddon('AF28', {name:'Advanced inventory logic'}),
+      sharedAddon('AF24', {name:'Customized delivery fee / rules'}),
+      sharedAddon('AF36', {name:'Richer / advanced order statuses'}),
+      sharedAddon('AF26', {name:'Return / refund workflow'}),
+      sharedAddon('AF17', {name:'Extra user roles'}),
+      sharedAddon('AF22', {name:'Custom reports / analytics'}),
+      sharedAddon('AF37', {name:'Automation'}),
+      sharedAddon('AF39', {editableOnQuotation:true}),
+      sharedAddon('AF40'),
+    ] },
+  { id:'SVC10', name:'E-Commerce Level 4 – Advanced / Integrated', projectType:'E-Commerce Level 4', category:'E-Commerce', basePrice:2000, year2Price:null, year3Price:null,
+    salesCanQuote:false, maxDiscountPct:0, defaultDelivery:'Quote after scoping', status:'Active', priceIsStartingFrom:true,
+    functions:[
+      svcFn('Full e-commerce engine'),
+      svcFn('Year 1 Hosting / Backend / Database'),
+      svcFn('Domain — Included in Year 1 (or Charged Separately / Client Already Owns Domain, per quotation)'),
+      // Candidate add-ons (Package Guide, E-Commerce Level 4 scope):
+      sharedAddon('AF16', {name:'Multi-branch / multi-warehouse'}),
+      sharedAddon('AF28', {name:'Advanced inventory'}),
+      sharedAddon('AF17', {name:'Multiple roles / permissions'}),
+      sharedAddon('AF25', {name:'Marketplace integration'}),
+      sharedAddon('AF13', {name:'POS integration'}),
+      sharedAddon('AF29', {name:'ERP integration'}),
+      sharedAddon('AF14', {name:'Accounting integration'}),
+      sharedAddon('AF19', {name:'Delivery / API integration'}),
+      sharedAddon('AF08', {name:'Additional payment integration'}),
+      sharedAddon('AF22', {name:'Advanced reports'}),
+      sharedAddon('AF26', {name:'Complex return / refund workflow'}),
+      sharedAddon('AF23', {name:'Loyalty / membership program'}),
+      sharedAddon('AF27', {name:'Wallet system'}),
+      sharedAddon('AF21', {name:'Large data migration'}),
+      sharedAddon('AF32', {name:'Heavy storage / server requirement'}),
+      sharedAddon('AF39', {editableOnQuotation:true}),
+      sharedAddon('AF40'),
+    ] },
+  { id:'SVC11', name:'Custom Business System', projectType:'Custom Business System', category:'Custom', basePrice:899, year2Price:null, year3Price:null,
+    salesCanQuote:false, maxDiscountPct:0, defaultDelivery:'Quote after scoping', status:'Active', priceIsStartingFrom:true,
+    functions:[
+      svcFn('Custom-scoped modules — defined per project scope'),
+      svcFn('Year 1 Hosting / Backend / Database', {priceType:'manual', defaultSelected:false}),
+      svcFn('Domain — separate, if applicable', {priceType:'manual', defaultSelected:false}),
+      // Candidate add-ons (Package Guide, Custom Business System scope):
+      sharedAddon('AF17', {name:'Additional roles / permissions'}),
+      sharedAddon('AF18', {name:'Approval workflow'}),
+      sharedAddon('AF11', {name:'Customer login'}),
+      sharedAddon('AF12', {name:'Inventory'}),
+      svcFn('Custom transaction workflow', {priceType:'manual', defaultSelected:false}),
+      sharedAddon('AF22', {name:'Advanced reports'}),
+      sharedAddon('AF37', {name:'Automation'}),
+      sharedAddon('AF19', {name:'API integration'}),
+      sharedAddon('AF16', {name:'Multi-branch'}),
+      sharedAddon('AF21', {name:'Large data import'}),
+      sharedAddon('AF32', {name:'Heavy file / storage usage'}),
+      sharedAddon('AF39', {editableOnQuotation:true}),
+      sharedAddon('AF40'),
+    ] },
+  // Mobile App / Advanced Platform: deliberately has no included-at-$0
+  // backend/domain/hosting line like every other package — those, and
+  // every listed feature, are itemized add-ons (mostly manual) priced per
+  // project, exactly as the Guide's own "$2,000 is only a floor" framing
+  // describes. iOS App and Android App default-selected since virtually
+  // every mobile project needs at least one platform; everything else is
+  // opt-in.
+  { id:'SVC12', name:'Mobile App / Advanced Platform', projectType:'Mobile App / Advanced Platform', category:'Mobile', basePrice:2000, year2Price:null, year3Price:null,
+    salesCanQuote:false, maxDiscountPct:0, defaultDelivery:'Quote after scoping', status:'Active', priceIsStartingFrom:true,
+    functions:[
+      svcFn('iOS App', {priceType:'manual', defaultSelected:true}),
+      svcFn('Android App', {priceType:'manual', defaultSelected:true}),
+      svcFn('Push Notifications', {priceType:'manual', defaultSelected:false}),
+      svcFn('Advanced backend / infrastructure — defined per project scope (domain, hosting, app-store and provider fees separately defined)', {priceType:'manual', defaultSelected:false}),
+      // Candidate add-ons (Package Guide, Mobile App / Advanced Platform scope):
+      sharedAddon('AF09', {name:'OTP / verification'}),
+      sharedAddon('AF08', {name:'Payment / KHQR'}),
+      sharedAddon('AF38', {name:'Subscription'}),
+      sharedAddon('AF23', {name:'Membership'}),
+      svcFn('Video call / real-time communication', {priceType:'manual', defaultSelected:false}),
+      sharedAddon('AF17', {name:'Multiple user roles'}),
+      svcFn('Admin portal / web dashboard', {priceType:'manual', defaultSelected:false}),
+      sharedAddon('AF19', {name:'Third-party API integration'}),
+      sharedAddon('AF32', {name:'Large media / storage requirement'}),
+      sharedAddon('AF39', {editableOnQuotation:true}),
+      sharedAddon('AF40'),
+    ] },
+];
+
+// Root-cause fix (BizWeb CRM -- Replace Founder Review with Configurable
+// Package Add-On Pricing, req #5: "Do not hardcode final business prices
+// across JS files... Founder/Admin should be able to manage add-on prices
+// from Settings"): this now reads the REAL, Founder/Admin-editable
+// Supabase-backed services table (DB._cache.services, populated by
+// DB.init() and edited via Settings -> Quotations / Service Price List)
+// instead of the hardcoded SERVICE_PRICE_LIST constant. Previously
+// Settings edits were saved to Supabase but NEVER actually consulted by
+// any quotation -- quotations.js read only the hardcoded array, so an
+// edited price silently had zero effect on real quotes. SERVICE_PRICE_LIST
+// remains in this file as the original seed/reference data (and a safety
+// fallback below, in case DB hasn't loaded yet or a project_type is
+// missing from the DB for any reason), but it is no longer the live
+// source of truth.
+function serviceByProjectType(projectType){
+  const live = (typeof DB!=='undefined' ? DB.all('services') : []).find(s=>s.projectType===projectType);
+  if(live) return live;
+  return SERVICE_PRICE_LIST.find(s=>s.projectType===projectType) || null;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Annual Cost Breakdown — package-driven defaults (spec: "Package         */
+/* selection controls ... default yearly costs"). A static website        */
+/* package (category 'Website') only ever needs a plain "Hosting" line;    */
+/* every dynamic/system package (CMS, Booking, CRM, E-Commerce, Custom,    */
+/* Mobile) needs the fuller "Hosting / Backend / Database" wording so      */
+/* Sales never has to hand-edit a label — the package decides it.          */
+/* ---------------------------------------------------------------------- */
+function hostingLabelForService(svc){
+  return (svc && svc.category==='Website') ? 'Hosting' : 'Hosting / Backend / Database';
+}
+// Package-specific Year 1/2/3 starting numbers for the new Annual Cost
+// Breakdown (spec item 7). These are only PREFILLED SUGGESTIONS — Sales or
+// Founder/Admin can edit every number per quotation; nothing here is
+// authoritative once a quotation is actually saved (the saved `annualCost`
+// object on the record is always the source of truth after that point,
+// same convention as `quotationDefaults()`'s exclusions/notes templates).
+// Starter/Dynamic CMS numbers below match the spec's own worked examples
+// (item 7); every other package gets a sensible split of its existing
+// year2Price/year3Price (Service Price List, Settings-editable) into a
+// hosting/backend/database share and a maintenance share, so no package
+// is ever left with an un-configured $0 default that looks broken.
+function defaultAnnualCostForService(svc){
+  // Per-year Maintenance COST vs NOTE model (generalizes the prior task's
+  // Year-1-only "maintenanceRemark" to all of Year 1/2/3 — see the big
+  // comment above normalizeAnnualCost() in quotations.js for the full
+  // shape/rationale). `maintenanceInclude` is the ONLY financial switch —
+  // it decides whether `maintenance` counts toward that year's Total.
+  // `maintenanceNote` is purely informational and independently toggled.
+  // Defaults for a BRAND-NEW quotation (task spec):
+  //   Year 1: Include=OFF, Note=ON/Free Period/"1 Month".
+  //   Year 2/3: Include=OFF, Note=OFF.
+  // An EXISTING quotation with no stored fields at all instead gets a safe
+  // OFF/OFF default for every year — see normalizeAnnualCost(), which is
+  // what every loaded/legacy record actually passes through.
+  const base = {
+    year1: { domain:0, domainMode:'included', hosting:0, hostingIncluded:true, maintenance:0,
+             maintenanceInclude:false,
+             maintenanceNote: { enabled:true, type:'freePeriod', period:'1 Month', customText:'' } },
+    year2: { domain: DEFAULT_DOMAIN_COST_ESTIMATE, hosting:0, maintenance:0,
+             maintenanceInclude:false,
+             maintenanceNote: { enabled:false, type:'freePeriod', period:'1 Month', customText:'' },
+             displayMode:'estimated' },
+    year3: { domain: DEFAULT_DOMAIN_COST_ESTIMATE, hosting:0, maintenance:0,
+             maintenanceInclude:false,
+             maintenanceNote: { enabled:false, type:'freePeriod', period:'1 Month', customText:'' },
+             displayMode:'estimated' },
+  };
+  if(!svc) return base;
+  // Custom Business System and Mobile App / Advanced Platform (APPROVED
+  // FINAL, 2026-09-13, Package Master rows 29/30 + Add-On row 68): unlike
+  // every other package, Year 1 hosting/backend/database and domain are
+  // NOT silently assumed included here — they are "separately defined per
+  // project" / "if quoted". Sales/Founder can still switch these back to
+  // Included per quotation exactly as before; only the SUGGESTED default
+  // changes for these two package types.
+  if(svc.projectType==='Custom Business System' || svc.projectType==='Mobile App / Advanced Platform'){
+    base.year1.hostingIncluded = false;
+    base.year1.domainMode = 'separate';
+  }
+  // Year 2/3 CORE RENEWAL — APPROVED FINAL explicit defaults (Section C of
+  // the 2026-09-13 approval), replacing the old automatic 70/30 Hosting/
+  // Maintenance split entirely (spec: "REMOVE the generic automatic 70/30
+  // split... Use explicit package-level estimates"). `maintenance` now
+  // always defaults to $0/Include-OFF for every package — maintenance is
+  // optional and separate, never bundled into the core renewal figure.
+  // Where the approval gives a range (e.g. "$120–150/year"), the LOW end
+  // of the range is used as the editable starting suggestion; Sales/
+  // Founder can raise it per quotation up to the approved ceiling.
+  // Packages marked "To be confirmed" get displayMode 'tbc' (no numeric
+  // default) instead of a fixed estimate.
+  const RENEWAL_DEFAULTS = {
+    'Starter Website':               { hosting: 45,  mode: 'estimated' }, // approved: ~$45/year
+    'Pro Website':                    { hosting: 60,  mode: 'estimated' }, // approved: ~$60/year
+    'Pro Max Website':                { hosting: 75,  mode: 'estimated' }, // approved: ~$75/year
+    'Dynamic Website / CMS':          { hosting: 120, mode: 'estimated' }, // approved: ~$120–150/year (low end)
+    'Booking System':                 { hosting: 150, mode: 'estimated' }, // approved: ~$150–180/year (low end)
+    'Customer Management System':     { hosting: 180, mode: 'estimated' }, // approved: ~$180–240/year (low end)
+    'E-Commerce Level 1':             { hosting: 150, mode: 'estimated' }, // approved: ~$150–180/year (low end)
+    'E-Commerce Level 2':             { hosting: 240, mode: 'estimated' }, // approved: ~$240–360/year (low end)
+    'E-Commerce Level 3':             { hosting: 0,   mode: 'tbc' },       // approved: To be confirmed
+    'E-Commerce Level 4':             { hosting: 0,   mode: 'tbc' },       // approved: To be confirmed
+    'Custom Business System':         { hosting: 0,   mode: 'tbc' },       // approved: To be confirmed
+    'Mobile App / Advanced Platform': { hosting: 0,   mode: 'tbc' },       // approved: To be confirmed
+  };
+  const r = RENEWAL_DEFAULTS[svc.projectType];
+  if(r){
+    base.year2.hosting = r.hosting; base.year2.maintenance = 0; base.year2.displayMode = r.mode;
+    base.year3.hosting = r.hosting; base.year3.maintenance = 0; base.year3.displayMode = r.mode;
+  }
+  return base;
+}
+// The user-facing label for a stored project-type/interested-service ID.
+// Every lead/project/quotation stores the internal projectType ID (see the
+// SERVICE_TYPES comment above) — this is the ONLY place that should ever
+// turn that ID into display text, so a future rename only has to change
+// SERVICE_PRICE_LIST's `.name` once instead of every render site. Falls
+// back to the raw id for legacy/free-form project types not in the price
+// list (e.g. 'Other', or old imported records) so nothing ever renders
+// blank.
+function serviceDisplayName(projectType){
+  const svc = serviceByProjectType(projectType);
+  return svc ? svc.name : (projectType || '');
+}
+// Same idea but prefers a service's short label where UI space is tight
+// (e.g. a Pipeline card badge) — only SVC06 (CRM) currently defines one;
+// every other service falls back to its normal full name.
+function serviceShortName(projectType){
+  const svc = serviceByProjectType(projectType);
+  return svc ? (svc.shortName || svc.name) : (projectType || '');
+}
+
+/* ---------------------------------------------------------------------- */
+/* Quotation template family — spec §29/§32: "A. Website Quotation"        */
+/* (Starter/Pro/Pro Max/Dynamic+CMS) vs "B. System Quotation" (Booking/    */
+/* Customer Management/E-Commerce/Custom/Mobile). Drives the Year 2/3 cost */
+/* structure, the standard exclusion block, and the printed document's     */
+/* Khmer/English title ("Website Quotation" vs "System Quotation").        */
+/* ---------------------------------------------------------------------- */
+const WEBSITE_TEMPLATE_PROJECT_TYPES = ['Starter Website', 'Pro Website', 'Pro Max Website', 'Dynamic Website / CMS'];
+function quotationTypeForProjectType(projectType){
+  return WEBSITE_TEMPLATE_PROJECT_TYPES.includes(projectType) ? 'website' : 'system';
+}
+// Domain estimate used to prefill a new quotation's Domain Cost — matches
+// BizWeb KH's real standard-domain budget seen on live quotations (e.g.
+// C039: "up to a normal registrar price of $15"). Founder/Admin can edit
+// per-quotation; this is only the starting suggestion.
+const DEFAULT_DOMAIN_COST_ESTIMATE = 15;
+
+// Year-by-year cost LABELS shown on the printed document — the actual dollar
+// figures come from the service's own basePrice/year2Price/year3Price
+// (Service Price List, Founder/Admin-editable in Settings), this only
+// controls what each year is described as including (spec §17).
+function yearCostLabels(quotationType){
+  return quotationType==='website'
+    ? { y1:'Website Development, Domain & Year-1 Hosting', y2:'Hosting & Domain Renewal', y3:'Hosting & Domain Renewal' }
+    : { y1:'Development, Domain, Hosting/Backend/Database & Maintenance', y2:'Hosting/Backend/Database & Domain Renewal (excl. Development)', y3:'Hosting/Backend/Database & Domain Renewal (excl. Development)' };
+}
+
+/* ---------------------------------------------------------------------- */
+/* Standard exclusions + Important Notes templates, by quotation type —    */
+/* Founder/Admin-editable (Settings → Quotations tab), Sales view-only.    */
+/* Seeded once into settings.quotationDefaults on first load; these        */
+/* constants are only the factory fallback if that settings JSON is empty. */
+/* ---------------------------------------------------------------------- */
+const DEFAULT_QUOTATION_EXCLUSIONS = {
+  website: [
+    'Online payment gateway / e-commerce checkout',
+    'Customer login / member accounts',
+    'Booking or appointment system',
+    'Custom backend system, database, or admin dashboard',
+    'Mobile app (iOS / Android)',
+    'Multi-branch / multi-location management',
+    'Third-party API integrations',
+  ],
+  system: [
+    'Public marketing website (unless separately quoted)',
+    'Online customer booking / public self-service booking',
+    'Online payment gateway',
+    'OTP / SMS verification',
+    'Payroll / HR management',
+    'Accounting integration',
+    'Full POS / inventory management',
+    'Loyalty program',
+    'Multi-branch support',
+    'Mobile app (iOS / Android)',
+  ],
+};
+/* ---------------------------------------------------------------------- */
+/* Package-specific exclusions — APPROVED FINAL, Section E, 2026-09-13.     */
+/* The two generic templates above (DEFAULT_QUOTATION_EXCLUSIONS.website/   */
+/* .system) previously applied uniformly to every package of that type —   */
+/* which produced real conflicts (e.g. the 'system' template excluded      */
+/* "online customer booking" even for the Booking System package itself,   */
+/* and the 'website' template excluded "backend/database/admin dashboard"  */
+/* even for the Dynamic Website + CMS package). Keyed by SERVICE_PRICE_    */
+/* LIST[].projectType. selectPackageOnQC() (quotations.js) now looks here  */
+/* FIRST and only falls back to the generic per-type template (still fully */
+/* Settings-editable, completely unchanged) for a projectType with no      */
+/* entry here (e.g. 'Other') — so the existing Settings → Quotations       */
+/* exclusion editor keeps working exactly as before, untouched.            */
+/* E-Commerce Level 3/4, Custom Business System and Mobile App / Advanced  */
+/* Platform intentionally get an EMPTY list — "no generic exclusion list,  */
+/* scope/exclusions defined per project" (approved Section E, last row).   */
+/* ---------------------------------------------------------------------- */
+const PACKAGE_SPECIFIC_EXCLUSIONS = {
+  'Starter Website': [
+    'CMS / admin dashboard', 'Database / backend', 'Customer login / member accounts',
+    'Booking or appointment system', 'Online payment gateway / e-commerce checkout',
+    'Mobile app (iOS / Android)', 'Custom API integrations',
+  ],
+  'Pro Website': [
+    'CMS / admin dashboard', 'Database / backend', 'Customer login / member accounts',
+    'Booking or appointment system', 'Online payment gateway / e-commerce checkout',
+    'Mobile app (iOS / Android)', 'Custom API integrations',
+  ],
+  'Pro Max Website': [
+    'CMS / admin dashboard', 'Database / backend', 'Customer login / member accounts',
+    'Booking or appointment system', 'Online payment gateway / e-commerce checkout',
+    'Mobile app (iOS / Android)', 'Custom API integrations',
+  ],
+  'Dynamic Website / CMS': [
+    'Customer login / member accounts', 'Booking or appointment system',
+    'Online payment gateway', 'OTP / SMS verification', 'Mobile app (iOS / Android)',
+  ],
+  'Booking System': [
+    'Customer login / member accounts (unless included)', 'OTP / SMS verification',
+    'Online payment gateway', 'Mobile app (iOS / Android)',
+  ],
+  'Customer Management System': [
+    'Public marketing website', 'Online customer booking / public self-service booking',
+    'Online payment gateway', 'OTP / SMS verification', 'Payroll / HR management',
+    'Accounting integration', 'Full POS / inventory management', 'Loyalty program',
+    'Multi-branch / multi-location', 'Mobile app (iOS / Android)',
+  ],
+  'E-Commerce Level 1': [
+    'Shopping cart', 'Online checkout / payment gateway', 'Customer login / member accounts',
+    'Advanced inventory / POS management', 'OTP / SMS verification', 'Mobile app (iOS / Android)',
+  ],
+  'E-Commerce Level 2': [
+    'Online payment gateway (unless explicitly included)',
+    'Advanced ERP / POS / inventory integrations', 'Third-party API integrations',
+  ],
+  'E-Commerce Level 3': [],
+  'E-Commerce Level 4': [],
+  'Custom Business System': [],
+  'Mobile App / Advanced Platform': [],
+};
+const DEFAULT_QUOTATION_NOTES = {
+  website: [
+    { key:'domainHosting', title:'Domain & Hosting Support', text:'Year 1 domain and hosting are included as quoted above. From Year 2 onward, domain and hosting renewal is billed annually at the rates shown.' },
+    { key:'annualRenewal', title:'Annual Renewal', text:'Annual renewal covers hosting and domain only. It does not include new features or major changes — those are quoted separately.' },
+    { key:'contentDelivery', title:'Content Delivery', text:'Client provides all text content, images/logo, and any account access needed (domain registrar, existing hosting, etc.) before development begins.' },
+    { key:'additionalFeatures', title:'Additional Features', text:'Any feature outside this quotation’s listed scope will be quoted separately.' },
+    { key:'providerCosts', title:'Provider Costs', text:'Domain/registrar costs are estimates and may vary slightly at the time of purchase/renewal. Any add-on requiring a third-party provider (e.g. payment gateway, SMS/OTP, hosting/storage upgrades) is billed as two separate items: BizWeb KH’s setup/integration fee, and the provider’s own recurring or usage-based fee, which is not included in BizWeb KH’s price.' },
+    { key:'newFeatures', title:'New Features', text:'New features requested after this quotation is accepted are quoted and invoiced separately.' },
+  ],
+  system: [
+    { key:'domainHosting', title:'Domain & Hosting Support', text:'Year 1 domain, hosting, backend and database are included as quoted above. From Year 2 onward these are billed annually as an Annual Renewal (Development is not part of the renewal).' },
+    { key:'annualRenewal', title:'Annual Renewal', text:'Annual renewal budget is an estimate based on current usage and may be adjusted before each renewal based on actual usage, storage, or provider pricing.' },
+    { key:'contentDelivery', title:'Content Delivery', text:'Client provides service/price lists, staff information, workflow rules, and any account access needed before development begins.' },
+    { key:'additionalFeatures', title:'Additional Features', text:'Features not listed in the Scope of Work above (see Exclusions) are not included and will be quoted separately.' },
+    { key:'providerCosts', title:'Provider Costs', text:'Hosting/backend/database and domain costs are estimates based on the agreed usage level and may vary if actual usage changes. Any add-on requiring a third-party provider (e.g. payment gateway, SMS/OTP, APIs, storage/bandwidth) is billed as two separate items: BizWeb KH’s setup/integration fee, and the provider’s own recurring or usage-based fee, which is not included in BizWeb KH’s price.' },
+    { key:'newFeatures', title:'New Features', text:'New features or major workflow changes requested after acceptance are scoped and quoted separately.' },
+  ],
+};
+// Standard Notes (spec §18) — ONE Founder/Admin-editable master text block,
+// separate from the per-quotation-type exclusions/notes templates above.
+// Create Quotation shows only a collapsed "Standard Notes Applied ✓" line
+// plus an optional Client-Specific Note textarea; Sales never edits this
+// master text (Settings → Quotations → General, Founder/Admin only).
+const DEFAULT_STANDARD_NOTES_TEXT = 'Prices are quoted in USD. Year 1 covers development plus the items shown above; Development is a one-time, Year-1-only cost — Year 2 and Year 3 are renewal/support costs only, never the development price again. Annual renewal and maintenance figures marked "Estimated" may be adjusted slightly at actual renewal time; figures marked "Exact" are fixed. Client provides all content, account access, and approvals needed for development to begin on schedule.';
+// Bundled KHQR payment QR (assets/payment/khqr.jpg), relative to the pages
+// that render quotations (dashboard/, same convention as the print logo at
+// assets/branding/bizweb-kh-logo-main-print.png). Used only as the fallback
+// when Settings → Quotations → General has no override saved.
+const DEFAULT_QR_IMAGE_URL = '../assets/payment/khqr.jpg';
+function quotationDefaults(){
+  const db = DB.read();
+  const qd = (db && db.settings && db.settings.quotationDefaults) || {};
+  return {
+    exclusions: (qd.exclusions && qd.exclusions.website && qd.exclusions.system) ? qd.exclusions : DEFAULT_QUOTATION_EXCLUSIONS,
+    notes: (qd.notes && qd.notes.website && qd.notes.system) ? qd.notes : DEFAULT_QUOTATION_NOTES,
+    validityDays: qd.validityDays || 30,
+    standardNotesText: (typeof qd.standardNotesText==='string' && qd.standardNotesText.trim()) ? qd.standardNotesText : DEFAULT_STANDARD_NOTES_TEXT,
+  };
+}
+function bankDetails(){
+  const db = DB.read();
+  const saved = db && db.settings && db.settings.bankDetails;
+  // qrImageUrl defaults to the bundled KHQR asset (assets/payment/khqr.jpg)
+  // rather than empty, so the payment section always has a real scannable
+  // QR out of the box; Founder/Admin can override it in Settings →
+  // Quotations → General with any other URL/path without touching code.
+  if(saved) return { ...saved, qrImageUrl: (saved.qrImageUrl && saved.qrImageUrl.trim()) ? saved.qrImageUrl : DEFAULT_QR_IMAGE_URL };
+  return {
+    accountName:'POLI CHHEAN', accountNumber:'001 355 592', bankName:'ABA Bank', memo:'', qrImageUrl:DEFAULT_QR_IMAGE_URL
+  };
+}
+
+/* ---------------------------------------------------------------------- */
+/* Payment schedule presets (spec §19) — splits a total into stages that   */
+/* ALWAYS sum back to exactly the total to the cent: every stage but the   */
+/* last is rounded normally to 2dp, and the last stage absorbs whatever    */
+/* cent(s) rounding left over, so `stages.reduce(sum) === total` always    */
+/* holds exactly, never off by a fraction of a cent.                       */
+/* ---------------------------------------------------------------------- */
+const PAYMENT_SCHEDULE_PRESETS = {
+  '30/70': [
+    { label:'Deposit (Stage 1)', pct:30 },
+    { label:'Final Payment', pct:70 },
+  ],
+  '30/30/40': [
+    { label:'Deposit (Stage 1)', pct:30 },
+    { label:'Milestone Payment (Stage 2)', pct:30 },
+    { label:'Final Payment (Stage 3)', pct:40 },
+  ],
+  '20/40/40': [
+    { label:'Deposit (Stage 1)', pct:20 },
+    { label:'Milestone Payment (Stage 2)', pct:40 },
+    { label:'Final Payment (Stage 3)', pct:40 },
+  ],
+  '50/50': [
+    { label:'Deposit', pct:50 },
+    { label:'Final Payment', pct:50 },
+  ],
+};
+function computePaymentSchedule(total, presetKey, customStages){
+  const t = Number(total) || 0;
+  let stages;
+  if(presetKey==='Custom' && Array.isArray(customStages) && customStages.length){
+    stages = customStages.map(s=>({ label: s.label, pct: Number(s.pct)||0 }));
+  } else {
+    stages = (PAYMENT_SCHEDULE_PRESETS[presetKey] || PAYMENT_SCHEDULE_PRESETS['30/70']).map(s=>({...s}));
+  }
+  let running = 0;
+  const out = stages.map((s, i)=>{
+    let amount;
+    if(i === stages.length-1){
+      amount = Math.round((t - running) * 100) / 100;
+    } else {
+      amount = Math.round(t * (s.pct/100) * 100) / 100;
+      running = Math.round((running + amount) * 100) / 100;
+    }
+    return { label: s.label, pct: s.pct, amount };
+  });
+  return out;
+}
+
+
+/* ---------------------------------------------------------------------- */
+/* Quotation rules engine                                                  */
+/* ---------------------------------------------------------------------- */
+
+// Root-cause fix (BizWeb CRM -- Replace Founder Review with Configurable
+// Package Add-On Pricing, 2026-10-02 approval): this function no longer
+// decides whether "Founder review" is required, and no longer returns an
+// approvalStatus -- that whole workflow is removed from quotation pricing
+// (Sales discusses complex/custom pricing with Founder externally over
+// Telegram, then enters the agreed figures here). It now answers two much
+// narrower, purely content-driven questions: (1) the discount/manual-
+// adjustment Sales-authority reasons -- unchanged, informational/audit
+// only, never blocked saving even before this change -- and (2) whether
+// any INDIVIDUAL selected item (a 'manual' price type with no amount
+// entered yet) is still unpriced, which is the only thing that can make
+// the aggregate Year 1 Total show as TBC (req #7: "Avoid TBC for the
+// entire quotation... If an individual function uses Manual pricing and
+// has no amount yet, show only that item as TBC").
+// `items` = flat array of { name, price (number|null = TBC), priceType, source }
+// `discountPct`, `manualAdjustment` ({amount, reason} or null)
+function evaluateQuotation({ items, basePackage, discountPct=0, manualAdjustment=null, discountLimitPct=10 }){
+  const reasons = [];
+  let priceIsTBC = false;
+
+  items.forEach(it=>{
+    if(it.price===null || it.price===undefined){
+      priceIsTBC = true;
+      reasons.push(`"${it.name}" is Manual pricing and still has no amount entered.`);
+    }
+  });
+
+  const subtotal = items.reduce((s,it)=> s + (it.price||0), 0);
+  let discountAmt = Math.round(subtotal * (discountPct/100) * 100)/100;
+  if(discountPct>discountLimitPct){
+    reasons.push(`Discount of ${discountPct}% exceeds Sales authority (max ${discountLimitPct}%).`);
+  }
+  let finalPrice = Math.round((subtotal - discountAmt)*100)/100;
+
+  if(manualAdjustment && manualAdjustment.amount){
+    finalPrice = Math.round((finalPrice + manualAdjustment.amount)*100)/100;
+    if(!manualAdjustment.reason || !manualAdjustment.reason.trim()){
+      reasons.push('Price adjustment is missing a required reason.');
+    }
+    if(Math.abs(manualAdjustment.amount) > subtotal*0.10){
+      reasons.push(`Manual price adjustment of $${manualAdjustment.amount} is unusually large (over 10% of subtotal).`);
+    }
+  }
+
+  return {
+    subtotal, discountAmt, finalPrice: priceIsTBC ? null : finalPrice,
+    priceIsTBC, reasons,
+  };
+}
+
+// BW-Q-{PROJECTCODE}-{YYYYMMDD}[-R{n}] (spec §14) — the first quotation for
+// a given project code on a given day gets the plain base number; every
+// later one for that SAME project code + SAME day (a same-day duplicate
+// quote, OR a new revision created by editing an already-Sent quotation —
+// both cases in the spec use this identical -R{n} suffix convention) gets
+// -R1, then -R2, -R3... incrementing until a free number is found. Never
+// returns a number that already exists.
+function generateQuoteNumber(refCode, dateStr){
+  const d = dateStr ? new Date(dateStr) : new Date();
+  const ymd = d.getFullYear() + String(d.getMonth()+1).padStart(2,'0') + String(d.getDate()).padStart(2,'0');
+  const base = `BW-Q-${refCode}-${ymd}`;
+  const taken = new Set(DB.all('quotations').map(q=>q.quoteNumber));
+  if(!taken.has(base)) return base;
+  let n = 1;
+  while(taken.has(`${base}-R${n}`)) n++;
+  return `${base}-R${n}`;
+}
+
+function slug(s){ return String(s).toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/(^-|-$)/g,''); }
+
+/* ---------------------------------------------------------------------- */
+/* Core DB helpers                                                        */
+/* ---------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------- */
+/* Supabase row <-> app-shape translation helpers                         */
+/* ---------------------------------------------------------------------- */
+
+const COLLECTION_TABLE = {
+  leads: 'leads', projects: 'projects', payments: 'payments', services: 'services',
+  leadActivities: 'lead_activities', quotations: 'quotations', invoices: 'invoices',
+  receipts: 'receipts',
+};
+
+function userIdToName(id){
+  if(!id) return null;
+  const u = (DB._cache.users||[]).find(u=>u.id===id);
+  return u ? u.name : null;
+}
+function userNameToId(name){
+  if(!name || name==='Unassigned') return null;
+  const u = (DB._cache.users||[]).find(u=>u.name===name);
+  return u ? u.id : null;
+}
+
+function rowToLead(row){
+  return {
+    id: row.id, clientName: row.client_name, businessName: row.business_name,
+    phone: row.phone || '', telegram: row.telegram || '', facebook: row.facebook || '', email: row.email || '',
+    industry: row.industry, interestedService: row.interested_service,
+    estimatedValue: row.estimated_value, leadSource: row.source,
+    assignedSales: userIdToName(row.assigned_sales) || 'Unassigned',
+    status: row.status,
+    nextFollowup: row.next_follow_up_date, lastContact: row.last_contact_date,
+    expectedCloseDate: row.expected_close_date,
+    quotationStatus: row.quotation_status, quotationAmount: row.quotation_amount,
+    quotationRef: row.quotation_ref || '', demoLink: row.demo_link || '',
+    notes: row.notes || '', lostReason: row.lost_reason, holdReason: row.hold_reason, projectCode: row.project_id,
+    createdAt: row.created_at, updatedAt: row.updated_at,
+    sourceFiles: [], sourceType: '', sourceDate: '', confidence: '',
+    needsManualReview: false, historicalListConflict: false,
+    archived: !!row.archived, archivedAt: row.archived_at,
+    archivedBy: userIdToName(row.archived_by), archiveReason: row.archive_reason,
+    followUpCreatedBy: userIdToName(row.follow_up_created_by),
+    followUpUpdatedAt: row.follow_up_updated_at,
+  };
+}
+function leadToRow(lead){
+  return {
+    id: lead.id, client_name: lead.clientName, business_name: lead.businessName,
+    phone: lead.phone || null, email: lead.email || null,
+    telegram: lead.telegram || null, facebook: lead.facebook || null,
+    industry: lead.industry || null, interested_service: lead.interestedService || null,
+    status: lead.status, source: lead.leadSource || null,
+    assigned_sales: userNameToId(lead.assignedSales),
+    estimated_value: lead.estimatedValue===''?null:lead.estimatedValue,
+    next_follow_up_date: lead.nextFollowup || null,
+    last_contact_date: lead.lastContact || null,
+    expected_close_date: lead.expectedCloseDate || null,
+    quotation_status: lead.quotationStatus || null,
+    quotation_amount: lead.quotationAmount===''?null:(lead.quotationAmount ?? null),
+    quotation_ref: lead.quotationRef || null,
+    demo_link: lead.demoLink || null,
+    notes: lead.notes || null,
+    lost_reason: lead.lostReason || null,
+    hold_reason: lead.holdReason || null,
+    archived: !!lead.archived, archived_at: lead.archivedAt || null,
+    archived_by: userNameToId(lead.archivedBy), archive_reason: lead.archiveReason || null,
+    follow_up_created_by: userNameToId(lead.followUpCreatedBy),
+    follow_up_updated_at: lead.followUpUpdatedAt || null,
+    project_id: lead.projectCode || null,
+    created_at: lead.createdAt || undefined,
+    updated_at: lead.updatedAt || new Date().toISOString(),
+  };
+}
+
+function rowToProject(row){
+  return {
+    id: row.id, leadId: row.lead_id, clientName: row.client_name, businessName: row.business_name,
+    phone: '', industry: row.industry, projectType: row.project_type,
+    estimatedValue: null, confirmedValue: row.confirmed_value, depositPct: null,
+    assignedSales: userIdToName(row.assigned_sales) || 'Unassigned',
+    stage: row.stage, startDate: row.start_date, expectedDelivery: row.expected_delivery,
+    leadSource: '', demoLink: '', quotationRef: '', notes: '',
+    functions: row.functions || [], createdAt: row.created_at,
+  };
+}
+function projectToRow(proj){
+  return {
+    id: proj.id, lead_id: proj.leadId, client_name: proj.clientName, business_name: proj.businessName,
+    industry: proj.industry || null, project_type: proj.projectType || null,
+    confirmed_value: proj.confirmedValue, stage: proj.stage,
+    assigned_sales: userNameToId(proj.assignedSales),
+    start_date: proj.startDate || null, expected_delivery: proj.expectedDelivery || null,
+    functions: proj.functions || [], created_at: proj.createdAt || undefined,
+  };
+}
+
+function rowToPayment(row){
+  return {
+    id: row.id, projectId: row.project_id, paymentNumber: row.payment_number,
+    amount: row.amount, date: row.payment_date, method: row.method, type: row.type,
+    reference: row.reference || '', note: row.note || '',
+    recordedBy: userIdToName(row.recorded_by) || 'System Import',
+    createdAt: row.created_at,
+    voided: !!row.voided, voidedBy: userIdToName(row.voided_by),
+    voidedAt: row.voided_at, voidReason: row.void_reason,
+    // Optional link to (at most) one Invoice (spec: Invoices module) — null
+    // for every payment recorded before this column existed, and for any
+    // payment recorded from a project with no invoice. Never duplicated;
+    // always a reference to this SAME row, never a copy.
+    invoiceId: row.invoice_id || null,
+  };
+}
+function paymentToRow(p){
+  return {
+    id: p.id, project_id: p.projectId, payment_number: p.paymentNumber, type: p.type,
+    amount: p.amount, payment_date: p.date, method: p.method,
+    reference: p.reference || null, note: p.note || null,
+    recorded_by: userNameToId(p.recordedBy), voided: !!p.voided,
+    voided_by: userNameToId(p.voidedBy), voided_at: p.voidedAt || null,
+    void_reason: p.voidReason || null, created_at: p.createdAt || undefined,
+    invoice_id: p.invoiceId || null,
+  };
+}
+
+function rowToActivity(row){
+  return {
+    id: row.id, at: row.occurred_at, userName: userIdToName(row.user_id) || 'System Import',
+    refType: row.ref_type, refId: row.ref_id, refLabel: row.ref_label, type: row.action_type,
+    description: row.description, fromValue: row.from_value, toValue: row.to_value, remark: row.remark,
+  };
+}
+// Note: activity_logs' primary key is a server-generated bigint identity —
+// the JS-side `id` (e.g. "A1234...") is NEVER sent on insert.
+function activityToInsertRow(a){
+  return {
+    occurred_at: a.at || new Date().toISOString(),
+    user_id: userNameToId(a.userName),
+    ref_type: a.refType, ref_id: a.refId, ref_label: a.refLabel,
+    action_type: a.type, description: a.description,
+    from_value: a.fromValue ?? null, to_value: a.toValue ?? null, remark: a.remark ?? null,
+  };
+}
+
+// lead_activities — persistent follow-up notes/history per lead (spec:
+// "Follow-up notes and follow-up history MUST survive refresh/logout/
+// browser restart"). Separate from activity_logs (the general audit trail)
+// because it carries typed follow_up_date/completed_at columns that
+// activity_logs deliberately does not have — this is NOT a duplicate of
+// the Activity Log; each follow-up action still also calls logActivity()
+// for the general chronological record, same as before.
+function rowToLeadActivity(row){
+  return {
+    id: row.id, leadId: row.lead_id, activityType: row.activity_type,
+    note: row.note || '', followUpDate: row.follow_up_date, completedAt: row.completed_at,
+    createdBy: userIdToName(row.created_by) || 'Unassigned',
+    createdAt: row.created_at, updatedAt: row.updated_at,
+  };
+}
+// Note: lead_activities' primary key is a server-generated bigint identity —
+// the JS-side `id` is never sent on insert (same pattern as activityToInsertRow).
+function leadActivityToInsertRow(a){
+  return {
+    lead_id: a.leadId, activity_type: a.activityType, note: a.note || null,
+    follow_up_date: a.followUpDate || null, completed_at: a.completedAt || null,
+    created_by: userNameToId(a.createdBy),
+  };
+}
+
+function rowToService(row){
+  return {
+    id: row.id, name: row.name, projectType: row.project_type, category: row.category,
+    basePrice: row.base_price, year2Price: row.year2_price, year3Price: row.year3_price,
+    salesCanQuote: row.sales_can_quote,
+    maxDiscountPct: row.max_discount_pct, defaultDelivery: row.default_delivery,
+    status: row.status, functions: row.functions || [], isActive: row.is_active,
+    priceIsStartingFrom: !!row.price_is_starting_from,
+  };
+}
+function serviceToRow(s){
+  return {
+    id: s.id, name: s.name, project_type: s.projectType, category: s.category,
+    base_price: s.basePrice, year2_price: s.year2Price, year3_price: s.year3Price,
+    sales_can_quote: s.salesCanQuote,
+    // founder_review_required stays false going forward -- the column is
+    // kept (not dropped) so this migration never risks a destructive
+    // schema change, but nothing reads it for pricing any more.
+    founder_review_required: false,
+    max_discount_pct: s.maxDiscountPct, default_delivery: s.defaultDelivery,
+    status: s.status, functions: s.functions || [], is_active: s.isActive !== false,
+    price_is_starting_from: !!s.priceIsStartingFrom,
+  };
+}
+
+// Quotations — each row is a fully self-contained snapshot (scope items,
+// exclusions, notes, payment schedule all inline as jsonb), which is what
+// makes versioning-on-edit safe: creating a new revision never risks
+// mutating an older, already-Sent version's numbers, because every version
+// is its own complete row (see saveQuotationFromState in quotations.js).
+function rowToQuotation(row){
+  return {
+    id: row.id, quoteNumber: row.quote_number,
+    rootQuotationId: row.root_quotation_id, version: row.version,
+    previousVersionId: row.previous_version_id,
+    leadId: row.lead_id, projectCode: row.project_code,
+    clientName: row.client_name, businessName: row.business_name,
+    phone: row.phone || '', telegram: row.telegram || '', industry: row.industry || '',
+    interestedService: row.interested_service || '',
+    packageKey: row.package_key, packageName: row.package_name,
+    quotationType: row.quotation_type,
+    status: row.status, approvalStatus: row.approval_status,
+    assignedSales: userIdToName(row.assigned_sales) || 'Unassigned',
+    currency: row.currency || 'USD',
+    domainName: row.domain_name || '', domainCost: row.domain_cost,
+    domainIncluded: row.domain_included !== false, domainRenewalEstimate: row.domain_renewal_estimate,
+    year1Total: row.year1_total, year2Total: row.year2_total, year3Total: row.year3_total,
+    discountPct: row.discount_pct || 0,
+    manualAdjustment: (row.manual_adjustment_amount!=null) ? { amount: row.manual_adjustment_amount, reason: row.manual_adjustment_reason||'' } : null,
+    paymentPreset: row.payment_preset || '30/70',
+    quotationDate: row.quotation_date, validUntil: row.valid_until,
+    demoLink: row.demo_link || '',
+    demoLinks: row.demo_links_extra || [],
+    items: row.scope_items || [], exclusions: row.exclusions || [],
+    importantNotes: row.important_notes || [], paymentSchedule: row.payment_schedule || [],
+    reasons: row.founder_review_reasons || [],
+    createdBy: userIdToName(row.created_by) || 'Unassigned',
+    approvedBy: userIdToName(row.approved_by),
+    createdAt: row.created_at, updatedAt: row.updated_at,
+    finalPrice: row.year1_total, priceIsTBC: row.year1_total==null,
+    basePrice: row.year1_total,
+  };
+}
+function quotationToRow(q){
+  return {
+    id: q.id, quote_number: q.quoteNumber,
+    root_quotation_id: q.rootQuotationId || q.id, version: q.version || 1,
+    previous_version_id: q.previousVersionId || null,
+    lead_id: q.leadId || null, project_code: q.projectCode || null,
+    client_name: q.clientName, business_name: q.businessName,
+    phone: q.phone || null, telegram: q.telegram || null, industry: q.industry || null,
+    interested_service: q.interestedService || null,
+    package_key: q.packageKey, package_name: q.packageName,
+    quotation_type: q.quotationType || 'website',
+    status: q.status, approval_status: q.approvalStatus || null,
+    assigned_sales: userNameToId(q.assignedSales),
+    currency: q.currency || 'USD',
+    domain_name: q.domainName || null, domain_cost: q.domainCost==null?null:Number(q.domainCost),
+    domain_included: q.domainIncluded !== false, domain_renewal_estimate: q.domainRenewalEstimate==null?null:Number(q.domainRenewalEstimate),
+    year1_total: q.year1Total==null?null:Number(q.year1Total),
+    year2_total: q.year2Total==null?null:Number(q.year2Total),
+    year3_total: q.year3Total==null?null:Number(q.year3Total),
+    discount_pct: Number(q.discountPct)||0,
+    manual_adjustment_amount: q.manualAdjustment ? Number(q.manualAdjustment.amount) : null,
+    manual_adjustment_reason: q.manualAdjustment ? (q.manualAdjustment.reason||'') : null,
+    payment_preset: q.paymentPreset || '30/70',
+    quotation_date: q.quotationDate, valid_until: q.validUntil || null,
+    demo_link: q.demoLink || null,
+    demo_links_extra: (q.demoLinks && q.demoLinks.length) ? q.demoLinks : null,
+    scope_items: q.items || [], exclusions: q.exclusions || [],
+    important_notes: q.importantNotes || [], payment_schedule: q.paymentSchedule || [],
+    founder_review_reasons: q.reasons || [],
+    created_by: userNameToId(q.createdBy), approved_by: userNameToId(q.approvedBy),
+    created_at: q.createdAt || undefined, updated_at: new Date().toISOString(),
+  };
+}
+
+// Invoices — same self-contained-snapshot convention as quotations (line
+// items inline as jsonb); Total Paid/Balance Due are NEVER stored on the
+// row, always derived live from linked payments (payments.invoice_id) via
+// invoicePaymentsFor()/invoiceTotalsFor() in invoices.js, same principle as
+// paymentSummaryFor() for projects.
+function rowToInvoice(row){
+  return {
+    id: row.id, invoiceNumber: row.invoice_number,
+    projectCode: row.project_code, leadId: row.lead_id,
+    clientName: row.client_name, businessName: row.business_name || '',
+    websiteLink: row.website_link || '',
+    invoiceDate: row.invoice_date, dueDate: row.due_date || '', projectStatus: row.project_status || '',
+    status: row.status || 'Draft', currency: row.currency || 'USD',
+    invoiceType: row.invoice_type || 'Custom',
+    paymentStageIndex: row.payment_stage_index===null || row.payment_stage_index===undefined ? null : Number(row.payment_stage_index),
+    items: row.items || [], discountAmount: Number(row.discount_amount)||0,
+    summary: row.summary || '', notes: row.notes || '',
+    assignedSales: userIdToName(row.assigned_sales) || 'Unassigned',
+    createdBy: userIdToName(row.created_by) || 'Unassigned',
+    createdAt: row.created_at, updatedAt: row.updated_at,
+  };
+}
+function invoiceToRow(inv){
+  return {
+    id: inv.id, invoice_number: inv.invoiceNumber,
+    project_code: inv.projectCode || null, lead_id: inv.leadId || null,
+    client_name: inv.clientName, business_name: inv.businessName || '',
+    website_link: inv.websiteLink || null,
+    invoice_date: inv.invoiceDate, due_date: inv.dueDate || null, project_status: inv.projectStatus || null,
+    status: inv.status || 'Draft', currency: inv.currency || 'USD',
+    invoice_type: inv.invoiceType || 'Custom',
+    payment_stage_index: inv.paymentStageIndex===null || inv.paymentStageIndex===undefined ? null : Number(inv.paymentStageIndex),
+    items: inv.items || [], discount_amount: Number(inv.discountAmount)||0,
+    summary: inv.summary || '', notes: inv.notes || '',
+    assigned_sales: userNameToId(inv.assignedSales),
+    created_by: userNameToId(inv.createdBy),
+    created_at: inv.createdAt || undefined, updated_at: new Date().toISOString(),
+  };
+}
+
+// BW-INV-{PROJECTCODE}-{SHORTNAME}-{YYYYMMDD} (mirrors generateQuoteNumber's
+// convention). SHORTNAME is the first significant word of the business name
+// (falling back to the client name), uppercased and truncated to 10 chars —
+// e.g. "HERO Electrical Appliances" -> "HERO", matching the real BW-INV-
+// C054-HERO-20260912 example this feature is modeled on. A same-day repeat
+// for the same project gets -R{n} appended, same collision-avoidance
+// convention as quotations.
+function invoiceShortName(text){
+  const words = String(text||'').trim().split(/\s+/).filter(Boolean);
+  const stop = new Set(['the','a','an','of','and','co','company']);
+  const w = words.find(x=> !stop.has(x.toLowerCase())) || words[0] || 'CLIENT';
+  return w.replace(/[^a-zA-Z0-9]/g,'').toUpperCase().slice(0,10) || 'CLIENT';
+}
+function generateInvoiceNumber(projectCode, nameForShort, dateStr){
+  const d = dateStr ? new Date(dateStr) : new Date();
+  const ymd = d.getFullYear() + String(d.getMonth()+1).padStart(2,'0') + String(d.getDate()).padStart(2,'0');
+  const code = projectCode || 'DIRECT';
+  const short = invoiceShortName(nameForShort);
+  const base = `BW-INV-${code}-${short}-${ymd}`;
+  const taken = new Set(DB.all('invoices').map(i=>i.invoiceNumber));
+  if(!taken.has(base)) return base;
+  let n = 1;
+  while(taken.has(`${base}-R${n}`)) n++;
+  return `${base}-R${n}`;
+}
+
+// Receipts — each row is a thin reference to an existing Payment record
+// (payment_id) plus display/denormalization fields (client/business name,
+// project code, an optional linked invoice_id) and its OWN lifecycle
+// (status: Issued/Cancelled, created_by/created_at, cancelled_by/at/reason).
+// It deliberately does NOT store amount/type/method/reference/note — those
+// are read LIVE from the linked payment (and paymentSummaryFor() for the
+// Project Value/Previously Paid/Total Paid/Remaining Balance block) every
+// time a receipt is rendered, so a receipt can never drift out of sync with
+// the payment ledger and no financial calculation is ever duplicated here
+// (see receipts.js — receiptPaymentAndSummary()).
+function rowToReceipt(row){
+  return {
+    id: row.id, receiptNumber: row.receipt_number,
+    paymentId: row.payment_id, projectCode: row.project_code, invoiceId: row.invoice_id || null,
+    clientName: row.client_name || '', businessName: row.business_name || '',
+    receiptDate: row.receipt_date, status: row.status || 'Issued',
+    createdBy: userIdToName(row.created_by) || 'Unassigned', createdAt: row.created_at,
+    cancelledBy: userIdToName(row.cancelled_by), cancelledAt: row.cancelled_at || null,
+    cancelReason: row.cancel_reason || null,
+    reissueOfReceiptId: row.reissue_of_receipt_id || null,
+  };
+}
+function receiptToRow(r){
+  return {
+    id: r.id, receipt_number: r.receiptNumber,
+    payment_id: r.paymentId, project_code: r.projectCode || null, invoice_id: r.invoiceId || null,
+    client_name: r.clientName || null, business_name: r.businessName || null,
+    receipt_date: r.receiptDate, status: r.status || 'Issued',
+    created_by: userNameToId(r.createdBy), created_at: r.createdAt || undefined,
+    cancelled_by: userNameToId(r.cancelledBy), cancelled_at: r.cancelledAt || null,
+    cancel_reason: r.cancelReason || null,
+    reissue_of_receipt_id: r.reissueOfReceiptId || null,
+  };
+}
+
+// BW-RC-{PROJECTCODE}-{YYYYMMDD}-{SEQ} (spec: Receipts module) — mirrors
+// generateInvoiceNumber's/generateQuoteNumber's collision-avoidance
+// convention exactly: SEQ is a 2-digit, per project+day counter (01, 02...)
+// found by scanning existing receipt numbers for that exact base, so it
+// never returns a number that already exists (e.g. BW-RC-{code}-{date}-01,
+// then -02 for a second receipt against the same project on the same day).
+function generateReceiptNumber(projectCode){
+  const code = projectCode || 'DIRECT';
+  const base = `RCT-${code}`;
+  const taken = new Set(DB.all('receipts').map(r=>r.receiptNumber));
+  let n = 1;
+  while(taken.has(`${base}-${String(n).padStart(3,'0')}`)) n++;
+  return `${base}-${String(n).padStart(3,'0')}`;
+}
+
+// Local copies of app.js's initialsOf()/avatarColorFor() — DB.init() (and
+// therefore rowToUser) runs during the dashboard bootstrap BEFORE app.js is
+// loaded (see dashboard/index.html), so this file can't rely on those
+// globals existing yet. Kept logically identical to the app.js versions.
+function _fallbackInitials(name){ return String(name||'?').split(' ').filter(Boolean).slice(0,2).map(s=>s[0]).join('').toUpperCase(); }
+function _fallbackAvatarColor(name){
+  const AVATAR_COLORS = ['#1d7bff','#18c8ff','#ff8a3d','#7c5cff','#12a775','#e0473c','#d98a12'];
+  let h=0; for(let i=0;i<String(name).length;i++) h = (h*31 + name.charCodeAt(i))>>>0;
+  return AVATAR_COLORS[h % AVATAR_COLORS.length];
+}
+function rowToUser(row){
+  return { id: row.id, username: row.name, name: row.name, role: row.role,
+           color: row.color || _fallbackAvatarColor(row.name), initials: row.initials || _fallbackInitials(row.name),
+           // Users & Roles Management fields (Settings -> Users & Roles) —
+           // status defaults to 'active' for any pre-existing row that
+           // predates this feature (matches the DB column's own default).
+           email: row.email || null, status: row.status || 'active',
+           invitedAt: row.invited_at || null, activatedAt: row.activated_at || null,
+           lastLoginAt: row.last_login_at || null, invitedBy: row.invited_by || null };
+}
+
+/* ---------------------------------------------------------------------- */
+/* Core DB — synchronous in-memory cache, backed by Supabase               */
+/* ---------------------------------------------------------------------- */
+
+const DB = {
+  _cache: { leads:[], projects:[], payments:[], activities:[], services:[],
+            settings:{}, users:[], quotations:[], followups:[], quotationReviews:[], leadActivities:[],
+            invoices:[], receipts:[] },
+  _initialized: false,
+
+  // Explicit application state. Everything except 'ready' is a refusal: all()/find() THROW instead of returning an empty list,
+  // and every write returns { ok:false } — so a failed load can never look like an empty CRM.
+  state: 'loading',          // loading | ready | auth_required | not_authorized | backend_unavailable | bootstrap_failed
+  stateReason: null,
+  stateRequestId: null,
+  _meta: null,               // { activity_logs_total, activity_logs_loaded, counts }
+  _pristine: {},             // last server-confirmed copy of every record, by collection and id — used for diffing and for rolling back a failed save
+  _inflight: 0,              // writes currently on the wire (the page asks before it unloads)
+  _bg: 0,                    // audit-trail writes currently on the wire
+
+  _setState(state, reason, requestId){ this.state = state; this.stateReason = reason || null; this.stateRequestId = requestId || null; },
+
+  // GET /api/bootstrap — ONE request that replaces the eleven table reads. Never throws; resolves { ok, state, error }.
+  async init(){
+    this._initialized = false; this._setState('loading');
+    const res = await BZ.api('GET', '/api/bootstrap');
+    if(res.status === 0 || res.status === 502 || res.status === 503 || res.status === 504){
+      this._setState('backend_unavailable', res.body && res.body.error || ('http ' + res.status), res.requestId);
+      return { ok:false, state:this.state, error:res };
+    }
+    if(res.status === 401){ this._setState('auth_required', res.body && res.body.error, res.requestId); return { ok:false, state:this.state, error:res }; }
+    if(res.status === 403){ this._setState('not_authorized', res.body && res.body.error, res.requestId); return { ok:false, state:this.state, error:res }; }
+    if(res.status !== 200 || !res.body){ this._setState('bootstrap_failed', res.body && res.body.error || ('http ' + res.status), res.requestId); return { ok:false, state:this.state, error:res }; }
+    const bad = DB._validateBootstrap(res.body);
+    if(bad){ this._setState('bootstrap_failed', bad, res.requestId); return { ok:false, state:this.state, error:res }; }
+    DB._load(res.body);
+    this._initialized = true; this._setState('ready');
+    return { ok:true, state:'ready' };
+  },
+
+  // A response that merely LOOKS ok is not enough: every collection must be present and agree with the server's own counts.
+  _validateBootstrap(d){
+    if(!d || typeof d !== 'object' || !d.me || !d.me.id || !d.me.role || !d.settings || typeof d.settings !== 'object' || !d.meta || !d.meta.counts) return 'malformed response';
+    for(const k of ['leads','projects','quotations','invoices','payments','receipts','services','profiles']){
+      if(!Array.isArray(d[k])) return 'missing collection ' + k;
+      if(d.meta.counts[k] !== d[k].length) return 'count mismatch for ' + k;
+    }
+    if(!Array.isArray(d.lead_activities) || !Array.isArray(d.activity_logs)) return 'missing history collections';
+    if(!d.profiles.some(p=>p.id === d.me.id)) return 'own profile missing';
+    return null;
+  },
+
+  _load(d){
+    // users first — lead/project/payment/activity mapping needs id->name lookups
+    this._cache.users = d.profiles.map(rowToUser);
+    this._cache.leads = d.leads.map(rowToLead);
+    this._cache.projects = d.projects.map(rowToProject);
+    this._cache.payments = d.payments.map(rowToPayment);
+    this._cache.activities = d.activity_logs.map(rowToActivity);
+    this._cache.services = d.services.map(rowToService);
+    this._cache.leadActivities = d.lead_activities.map(rowToLeadActivity);
+    this._cache.quotations = d.quotations.map(rowToQuotation);
+    this._cache.invoices = d.invoices.map(rowToInvoice);
+    this._cache.receipts = d.receipts.map(rowToReceipt);
+    this._cache.settings = {
+      discountLimitPct: d.settings.discount_limit_pct || 10,
+      bankDetails: d.settings.bank_details || null,
+      quotationDefaults: d.settings.quotation_defaults || null,
+    };
+    this._cache.followups = []; this._cache.quotationReviews = [];
+    this._meta = d.meta;
+    this._pristine = {};
+    for(const c of ['leads','projects','payments','services','quotations','invoices','receipts']) this._cache[c].forEach(r=> this._snap(c, r));
+  },
+
+  reset(){ return this.init(); },
+
+  // Re-fetches the staff list (Settings -> Users & Roles; founder and operations only).
+  async refreshUsers(){
+    const res = await BZ.api('GET', '/api/staff');
+    if(res.status !== 200 || !Array.isArray(res.body)){ console.error('staff refresh failed', res.status); return { ok:false, userMessage: BZ.explain(res, 'The staff list could not be refreshed.') }; }
+    this._cache.users = res.body.map(rowToUser);
+    return { ok:true, users:this._cache.users };
+  },
+
+  read(){ return this._cache; },
+  write(db){ this._cache = db; return true; },
+
+  // ----- reads (synchronous, from the confirmed cache) -----
+  all(collection){
+    if(this.state !== 'ready') throw new Error(`CRM data is not ready (${this.state}${this.stateReason ? ': ' + this.stateReason : ''}); refusing to return an empty list`);
+    return this._cache[collection] || [];
+  },
+  find(collection, id){ return this.all(collection).find(x=>x.id===id) || null; },
+  isReady(){ return this.state === 'ready'; },
+
+  /* ------------------------------------------------------------------ */
+  /* WRITES — every one is awaited, confirmed by the server, and returns */
+  /* { ok:true, record } or { ok:false, error, userMessage }.            */
+  /* The cache changes only AFTER the server confirmed.                  */
+  /* ------------------------------------------------------------------ */
+  _snap(coll, rec){ (this._pristine[coll] || (this._pristine[coll] = new Map())).set(rec.id, JSON.stringify(rec)); },
+  _restore(coll, rec){
+    const s = this._pristine[coll] && this._pristine[coll].get(rec.id); if(!s) return;
+    const o = JSON.parse(s); Object.keys(rec).forEach(k=>{ delete rec[k]; }); Object.assign(rec, o);
+  },
+  _fail(res, what){
+    return { ok:false, error:{ status:res.status, code:res.body && res.body.error || null, message:res.body && res.body.message || null, requestId:res.requestId }, userMessage: BZ.explain(res, what) };
+  },
+  _notReady(){ return { ok:false, error:{ status:0, code:'not_ready' }, userMessage:'The CRM data is not loaded, so changes are disabled. Please refresh the page.' }; },
+  _mapRow(coll, row){ return ({ leads:rowToLead, projects:rowToProject, payments:rowToPayment, services:rowToService, quotations:rowToQuotation, invoices:rowToInvoice, receipts:rowToReceipt }[coll])(row); },
+  _apiBody(coll, rec){
+    const row = ({ leads:leadToRow, projects:projectToRow, payments:paymentToRow, services:serviceToRow, quotations:quotationToRow, invoices:invoiceToRow, receipts:receiptToRow }[coll])(rec);
+    const out = {}; for(const k of API_COLUMNS[coll]) if(k in row && row[k] !== undefined) out[k] = row[k]; return out;
+  },
+  _adopt(coll, target, row){            // replace the contents of `target` (keeps every UI reference valid) with the server's version
+    const mapped = this._mapRow(coll, row); Object.keys(target).forEach(k=>{ delete target[k]; }); Object.assign(target, mapped); this._snap(coll, target); return target;
+  },
+
+  // CREATE — POST. The id / number is assigned by the server and written into `rec`. A create can never overwrite an existing record.
+  // extra (projects only): { code, linkLeadId, setLeadStatus } — the server links the lead in the SAME transaction.
+  async create(coll, rec, extra){
+    if(this.state !== 'ready') return this._notReady();
+    if(!API_COLUMNS[coll]) return { ok:false, error:{ code:'unknown_collection' }, userMessage:'Internal error: unknown collection.' };
+    const body = this._apiBody(coll, rec);
+    Object.keys(body).forEach(k=>{ if(body[k] === null) delete body[k]; });
+    if(extra && coll === 'projects'){ if(extra.code) body.code = extra.code; if(extra.linkLeadId) body.link_lead_id = extra.linkLeadId; if(extra.setLeadStatus) body.set_lead_status = extra.setLeadStatus; }
+    const key = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : undefined;
+    this._inflight++;
+    let res; try{ res = await BZ.api('POST', '/api/' + coll, body, key ? { headers:{ 'Idempotency-Key': key } } : {}); } finally { this._inflight--; }
+    // one automatic retry with the SAME key is safe: the server replays the original answer instead of creating a second row
+    if((res.status === 0 || res.status === 429 || res.status === 503) && key){
+      await new Promise(r=>setTimeout(r, res.status === 429 ? Math.max(1, res.retryAfter)*1000 : 800));
+      this._inflight++; try{ res = await BZ.api('POST', '/api/' + coll, body, { headers:{ 'Idempotency-Key': key } }); } finally { this._inflight--; }
+    }
+    if(res.status !== 201 && res.status !== 200) return this._fail(res);
+    this._adopt(coll, rec, res.body);
+    const list = this._cache[coll]; if(!list.some(x=>x===rec)) list.push(rec);
+    if(coll === 'projects' && extra && extra.linkLeadId) await this.refresh('leads', extra.linkLeadId);       // the server changed the lead too
+    return { ok:true, record:rec };
+  },
+
+  // UPDATE — PATCH of ONLY the fields that changed since the last server-confirmed copy. `rec` is normally the cached object the caller already edited in place:
+  // if the server refuses, the in-place edit is rolled back so the screen never shows data the server does not have.
+  async update(coll, rec){
+    if(this.state !== 'ready') return this._notReady();
+    if(!API_COLUMNS[coll]) return { ok:false, error:{ code:'unknown_collection' }, userMessage:'Internal error: unknown collection.' };
+    const snapStr = this._pristine[coll] && this._pristine[coll].get(rec.id);
+    if(!snapStr) return { ok:false, error:{ code:'not_loaded' }, userMessage:'This record is not loaded, so it cannot be updated. Please refresh the page.' };
+    const before = JSON.parse(snapStr); const a = this._apiBody(coll, before), b = this._apiBody(coll, rec); const patch = {};
+    for(const k of Object.keys(b)) if(JSON.stringify(a[k]) !== JSON.stringify(b[k])) patch[k] = b[k];
+    const cached = this._cache[coll].find(x=>x.id === rec.id);
+    if(!Object.keys(patch).length){ if(cached && cached !== rec){ this._cache[coll][this._cache[coll].indexOf(cached)] = rec; } return { ok:true, record:rec, unchanged:true }; }
+    if(UPDATED_AT_COLLECTIONS.includes(coll) && before.updatedAt) patch.expected_updated_at = before.updatedAt;      // stale-record protection
+    this._inflight++;
+    let res; try{ res = await BZ.api('PATCH', '/api/' + coll + '/' + encodeURIComponent(rec.id), patch); } finally { this._inflight--; }
+    if(res.status !== 200){ if(cached === rec) this._restore(coll, rec); return this._fail(res); }
+    this._adopt(coll, rec, res.body);
+    if(cached && cached !== rec) this._cache[coll][this._cache[coll].indexOf(cached)] = rec; else if(!cached) this._cache[coll].push(rec);
+    return { ok:true, record:rec };
+  },
+
+  async remove(coll, id){
+    if(this.state !== 'ready') return this._notReady();
+    this._inflight++;
+    let res; try{ res = await BZ.api('DELETE', '/api/' + coll + '/' + encodeURIComponent(id)); } finally { this._inflight--; }
+    if(res.status !== 200) return this._fail(res);
+    this._cache[coll] = this._cache[coll].filter(x=>x.id !== id); if(this._pristine[coll]) this._pristine[coll].delete(id);
+    return { ok:true };
+  },
+
+  // Re-reads ONE record from the server (used after the server changed something the browser did not ask for).
+  async refresh(coll, id){
+    const res = await BZ.api('GET', '/api/' + coll + '/' + encodeURIComponent(id));
+    if(res.status !== 200) return this._fail(res);
+    const cur = this._cache[coll].find(x=>x.id === id);
+    if(cur) this._adopt(coll, cur, res.body); else { const n = this._mapRow(coll, res.body); this._snap(coll, n); this._cache[coll].push(n); }
+    return { ok:true };
+  },
+
+  // Settings (founder only): PUT with just the changed fields.
+  async saveSettings(record){
+    if(this.state !== 'ready') return this._notReady();
+    const patch = {};
+    if(record.discountLimitPct !== undefined) patch.discount_limit_pct = record.discountLimitPct;
+    if(record.bankDetails !== undefined) patch.bank_details = record.bankDetails;
+    if(record.quotationDefaults !== undefined) patch.quotation_defaults = record.quotationDefaults;
+    this._inflight++;
+    let res; try{ res = await BZ.api('PUT', '/api/settings', patch); } finally { this._inflight--; }
+    if(res.status !== 200) return this._fail(res);
+    const s = res.body; this._cache.settings = { discountLimitPct: s.discount_limit_pct || 10, bankDetails: s.bank_details || null, quotationDefaults: s.quotation_defaults || null };
+    return { ok:true, record:this._cache.settings };
+  },
+
+  // Financial state changes have their own endpoints (never a generic PATCH).
+  async voidPayment(id, reason){
+    if(this.state !== 'ready') return this._notReady();
+    this._inflight++; let res; try{ res = await BZ.api('POST', '/api/payments/' + encodeURIComponent(id) + '/void', { reason: reason || '' }); } finally { this._inflight--; }
+    if(res.status !== 200) return this._fail(res);
+    const rec = this._cache.payments.find(x=>x.id === id); if(rec) this._adopt('payments', rec, res.body);
+    return { ok:true, record:rec };
+  },
+  // voidPayment:true voids the receipt AND its payment in ONE server transaction (what the Void Receipt action has always done).
+  async cancelReceipt(id, reason, voidPayment){
+    if(this.state !== 'ready') return this._notReady();
+    this._inflight++; let res; try{ res = await BZ.api('POST', '/api/receipts/' + encodeURIComponent(id) + '/cancel', { reason: reason || '', void_payment: !!voidPayment }); } finally { this._inflight--; }
+    if(res.status !== 200) return this._fail(res);
+    const rec = this._cache.receipts.find(x=>x.id === id); if(rec) this._adopt('receipts', rec, res.body);
+    if(voidPayment && res.body && res.body.payment_id) await this.refresh('payments', res.body.payment_id);
+    return { ok:true, record:rec };
+  },
+
+  // Append-only histories. `rec` receives the server's id/time. Failure is reported to the caller; logActivity() (below) surfaces it to the user.
+  async appendActivity(rec){
+    if(this.state !== 'ready') return this._notReady();
+    const b = activityToInsertRow(rec); const body = { ref_type:b.ref_type, ref_id:b.ref_id, ref_label:b.ref_label, action_type:b.action_type, description:b.description, from_value:b.from_value, to_value:b.to_value, remark:b.remark };
+    Object.keys(body).forEach(k=>{ if(body[k] === null || body[k] === undefined) delete body[k]; });
+    this._bg++; let res; try{ res = await BZ.api('POST', '/api/activity', body); } finally { this._bg--; }
+    if(res.status !== 201) return this._fail(res);
+    Object.assign(rec, rowToActivity(res.body)); this._cache.activities.unshift(rec); if(this._meta) this._meta.activity_logs_total++; return { ok:true, record:rec };
+  },
+  async appendLeadActivity(rec){
+    if(this.state !== 'ready') return this._notReady();
+    const b = leadActivityToInsertRow(rec); const body = { lead_id:b.lead_id, activity_type:b.activity_type, note:b.note, follow_up_date:b.follow_up_date, completed_at:b.completed_at };
+    Object.keys(body).forEach(k=>{ if(body[k] === null || body[k] === undefined) delete body[k]; });
+    this._inflight++; let res; try{ res = await BZ.api('POST', '/api/lead_activities', body); } finally { this._inflight--; }
+    if(res.status !== 201) return this._fail(res);
+    Object.assign(rec, rowToLeadActivity(res.body)); this._cache.leadActivities.unshift(rec); return { ok:true, record:rec };
+  },
+
+  // The bootstrap carries the newest 500 history rows; older rows stay in the database and are fetched here on demand (nothing is ever deleted).
+  async loadOlderActivities(limit){
+    const list = this._cache.activities; const ids = list.map(a=>Number(a.id)).filter(Number.isFinite);
+    const before = ids.length ? Math.min.apply(null, ids) : 9e15;
+    const res = await BZ.api('GET', '/api/activities?before=' + before + '&limit=' + (limit || 200));
+    if(res.status !== 200 || !Array.isArray(res.body)) return this._fail(res, 'Older history could not be loaded.');
+    res.body.map(rowToActivity).forEach(a=>{ if(!list.some(x=>x.id === a.id)) list.push(a); });
+    return { ok:true, loaded:res.body.length, hasMore: res.body.length >= (limit || 200) };
+  },
+  activityTotals(){ return { total: this._meta ? this._meta.activity_logs_total : null, loaded: this._cache.activities.filter(a=>Number.isFinite(Number(a.id))).length }; },
+
+  // The old fire-and-forget entry point is GONE on purpose: any call site that was missed fails loudly instead of silently not saving.
+  upsert(){ throw new Error('DB.upsert() has been removed in the Neon build: use await DB.create / DB.update / DB.saveSettings / DB.appendActivity / DB.appendLeadActivity and check result.ok'); },
+  nextId(){ throw new Error('DB.nextId() has been removed in the Neon build: identifiers are assigned by the server when the record is saved'); }
+};
+
+// Columns the API accepts per collection (mirror of api/crm/registry.ts — the server re-validates everything).
+const API_COLUMNS = {
+  leads: ['client_name','business_name','phone','email','industry','interested_service','status','source','assigned_sales','estimated_value','next_follow_up_date','last_contact_date','lost_reason','project_id','archived','archived_at','archived_by','archive_reason','follow_up_created_by','follow_up_updated_at','telegram','facebook','notes','expected_close_date','quotation_status','quotation_amount','quotation_ref','demo_link','hold_reason'],
+  projects: ['lead_id','client_name','business_name','industry','project_type','confirmed_value','stage','assigned_sales','start_date','expected_delivery','functions'],
+  quotations: ['root_quotation_id','version','previous_version_id','lead_id','project_code','client_name','business_name','phone','telegram','industry','interested_service','package_key','package_name','quotation_type','status','approval_status','assigned_sales','currency','domain_name','domain_cost','domain_included','domain_renewal_estimate','year1_total','year2_total','year3_total','discount_pct','manual_adjustment_amount','manual_adjustment_reason','payment_preset','quotation_date','valid_until','demo_link','scope_items','exclusions','important_notes','payment_schedule','founder_review_reasons','approved_by','demo_links_extra'],
+  invoices: ['project_code','lead_id','client_name','business_name','website_link','invoice_date','project_status','status','currency','items','discount_amount','summary','notes','assigned_sales','invoice_type','due_date','payment_stage_index'],
+  payments: ['project_id','payment_number','type','amount','payment_date','method','reference','note','invoice_id'],
+  receipts: ['payment_id','project_code','invoice_id','client_name','business_name','receipt_date','reissue_of_receipt_id'],
+  services: ['name','project_type','category','base_price','minimum_price','maximum_price','description','year2_price','year3_price','sales_can_quote','founder_review_required','max_discount_pct','default_delivery','status','functions','is_active','price_is_starting_from'],
+};
+const UPDATED_AT_COLLECTIONS = ['leads','projects','quotations','invoices'];
+
+// A page must not be closed while a save is still on the wire.
+window.addEventListener('beforeunload', (e)=>{ if(DB._inflight > 0){ e.preventDefault(); e.returnValue = 'A save is still in progress.'; return e.returnValue; } });
+
+
+/* ---------------------------------------------------------------------- */
+/* Project Code — shared uniqueness/normalization rules, used by every    */
+/* place a code can be entered or changed: the Qualified -> Quote and     */
+/* Demo Sent status-change gate (app.js openStatusChangeModal), Create    */
+/* Direct Project and Confirm Project (projects.js). A code lives in ONE  */
+/* shared pool across two places — a lead's own `projectCode` (reserved   */
+/* before any Project row exists) and a Project's own `id` (its primary   */
+/* key, from the moment it's created) — so every check here always looks  */
+/* at leads AND projects together, never just one collection.             */
+/* ---------------------------------------------------------------------- */
+
+// "C046" / "c046" / "  c046  " must all collide as the exact same code
+// (spec: case-insensitive comparison), and the CRM's existing convention
+// (DB.nextId('C','projects'), every historical project id) is uppercase —
+// so entered codes are normalized to trimmed-and-uppercase, consistently,
+// everywhere one is accepted.
+function normalizeProjectCode(raw){
+  return String(raw==null ? '' : raw).trim().toUpperCase();
+}
+
+// Root-cause fix (Pipeline/Projects code-consistency audit, Rabbit Travel
+// Cambodia incident): normalizeProjectCode() above only trims/uppercases --
+// it never enforced the CRM's own "C" + digits convention, so a value like
+// "062" (missing the C, or any other shape) passed every existing check
+// silently. That is exactly how a Lead's reserved code drifted away from
+// its own already-created Project's id undetected (confirmed via the
+// Activity Log: Project C060 was created correctly, then a later manual
+// Edit Project Code save accepted "062" with no format check at all).
+// Every place a NEW or EDITED project code is accepted from a user must
+// reject anything that doesn't match this shape -- called AFTER
+// normalizeProjectCode(), and only against a non-empty value (blank is
+// handled separately by each call site's own "required" check).
+function isValidProjectCodeFormat(code){
+  return /^C\d+$/.test(code);
+}
+
+// Root-cause fix, part 2: every "is this lead already converted to a
+// Project?" check in the app used to look up the Project by matching the
+// LEAD's own (possibly already-drifted) `projectCode` string -- which goes
+// silently blind the moment that string stops matching the Project's real
+// `id` (precisely the broken state this audit found, and precisely why
+// the previous C059/C060 lock could still be bypassed once a code had
+// already drifted once). A Project's `leadId` is set once, at creation,
+// and never edited again -- so looking it up by that structural
+// relationship instead of by the copy-of-a-string is the actual single
+// source of truth, and can never be fooled by a later edit to either
+// side. Falls back to the old code-match lookup only for a Project with
+// no leadId at all (a Direct Project not linked to any lead).
+function findLinkedProjectForLead(lead){
+  if(!lead) return null;
+  const byRelationship = DB.all('projects').find(p=>p.leadId===lead.id);
+  if(byRelationship) return byRelationship;
+  return lead.projectCode ? DB.find('projects', lead.projectCode) : null;
+}
+
+// True if `code` (case-insensitively) is already in use by a DIFFERENT
+// lead's reserved projectCode or a DIFFERENT project's id. Pass
+// excludeLeadId/excludeProjectId to allow a lead/project to keep its own
+// already-assigned code (editing/re-saving something that already holds
+// this exact code is never a "duplicate" of itself).
+function isProjectCodeTaken(code, { excludeLeadId=null, excludeProjectId=null } = {}){
+  const norm = normalizeProjectCode(code);
+  if(!norm) return false;
+  const inProjects = DB.all('projects').some(p=> p.id && normalizeProjectCode(p.id)===norm && p.id!==excludeProjectId);
+  if(inProjects) return true;
+  const inLeads = DB.all('leads').some(l=> l.projectCode && normalizeProjectCode(l.projectCode)===norm && l.id!==excludeLeadId);
+  return inLeads;
+}
+
+// Pure calculation, no DB access — takes a flat list of raw code-like
+// values (any mix of null/undefined/blank/garbage is fine, non-matching
+// entries are just ignored) and returns the highest valid "C" + digits
+// code found (by NUMERIC value, never by count of entries or position —
+// a list like [C001,C002,C005,C058] must resolve to C058, not "5th item"
+// or "count=4") plus the next suggested code.
+//
+// Matching is case-insensitive ("c058" counts the same as "C058"), and the
+// suggested code's zero-padding defaults to the SAME digit-width as the
+// highest code found (so a codebase using e.g. C01..C58 keeps suggesting
+// 2-digit codes) but never truncates: if incrementing pushes the number
+// past that width (C099 -> 100), the width simply expands to fit
+// (Math.max(existingPadWidth, String(incremented).length)) rather than
+// staying short or zero-padding over the extra digit.
+//
+// Returns { lastUsed, suggested } where lastUsed is the normalized
+// (uppercase) highest code found, or null if nothing valid was found
+// anywhere — in which case `suggested` falls back to 'C001', the CRM's
+// existing seed convention.
+function computeNextProjectCode(allCodes){
+  let max = 0, padWidth = 3, lastUsed = null;
+  (allCodes||[]).forEach(raw=>{
+    const norm = normalizeProjectCode(raw);
+    const m = norm.match(/^C(\d+)$/i);
+    if(!m) return;
+    const num = parseInt(m[1],10);
+    if(lastUsed===null || num>max){
+      max = num;
+      padWidth = m[1].length;
+      lastUsed = norm;
+    }
+  });
+  if(lastUsed===null) return { lastUsed:null, suggested:'C001' };
+  const nextNum = max+1;
+  const width = Math.max(padWidth, String(nextNum).length);
+  return { lastUsed, suggested: 'C'+String(nextNum).padStart(width,'0') };
+}
+
+// A convenience PREFILL only (never auto-assigned without the user seeing
+// and being able to change it) — reuses the CRM's existing "C" + zero-
+// padded number convention (the same one DB.nextId('C','projects') already
+// applies), scanning every place a project code can live (projects' ids,
+// leads' reserved codes, and quotations'/invoices' own projectCode field,
+// in case one of those references a code not yet reflected on a lead or
+// project row) so the suggestion can never collide with a code that's
+// only reserved somewhere else. Delegates the actual max/next math to
+// computeNextProjectCode() so there's exactly one implementation of the
+// "highest numeric code, padding-safe" rule shared by the prefill and by
+// the Edit Project Code popup's "Last used / Suggested next" remark.
+function allKnownProjectCodes(){
+  return [
+    ...DB.all('projects').map(p=>p.id),
+    ...DB.all('leads').map(l=>l.projectCode),
+    ...DB.all('quotations').map(q=>q.projectCode),
+    ...DB.all('invoices').map(i=>i.projectCode)
+  ];
+}
+
+function suggestNextProjectCode(){
+  return computeNextProjectCode(allKnownProjectCodes()).suggested;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Activity logging — the single source of truth for "who changed what"   */
+/* ---------------------------------------------------------------------- */
+
+function logActivity({ userName, refType, refId, refLabel, type, description, fromValue=null, toValue=null, remark=null }){
+  const rec = {
+    id: null,                              // assigned by the server when the entry is stored
+    at: new Date().toISOString(),
+    userName, refType, refId, refLabel, type, description,
+    fromValue, toValue, remark
+  };
+  // The history row is written AFTER the business change was confirmed (callers log only on success). It is awaited in the background and a
+  // failure is shown to the user — never swallowed.
+  DB.appendActivity(rec).then(r=>{
+    if(!r.ok){
+      console.error('Activity history entry was not saved', r.error);
+      try{ toast('The change was saved, but its history entry could not be recorded: ' + r.userMessage, 'error'); }catch(e){}
+    }
+  });
+  return rec;
+}
+// Same, but the caller can wait for (and check) the result.
+function logActivityAsync(entry){
+  const rec = { id: null, at: new Date().toISOString(), fromValue:null, toValue:null, remark:null, ...entry };
+  return DB.appendActivity(rec);
+}
+
+function activitiesFor(refId){
+  return DB.all('activities').filter(a=>a.refId===refId).sort((a,b)=> new Date(b.at)-new Date(a.at));
+}
+
+/* ---------------------------------------------------------------------- */
+/* Payment LEDGER — the single source of truth for what a project has     */
+/* actually been paid. A project's Confirmed Value is stored on the       */
+/* project record itself; everything about what's been PAID against that  */
+/* value is derived live from this ledger, never cached/duplicated. This  */
+/* is what makes "Remaining Balance" always correct, no matter how many    */
+/* partial payments a project has received.                               */
+/* ---------------------------------------------------------------------- */
+
+// Voided payments stay in the ledger forever (audit trail — never silently
+// deleted) but never count toward Total Paid / Remaining / Payment Status.
+// paymentsForProject() returns every non-voided entry by default; pass
+// {includeVoided:true} for UI that needs to show/manage voided rows too
+// (e.g. the Payment History list, which shows a "Voided" badge on them).
+function paymentsForProject(projectId, opts={}){
+  return DB.all('payments')
+    .filter(p=>p.projectId===projectId)
+    .filter(p=> opts.includeVoided ? true : !p.voided)
+    .sort((a,b)=> new Date(a.date||a.createdAt) - new Date(b.date||b.createdAt));
+}
+function totalPaidForProject(projectId){
+  return paymentsForProject(projectId).reduce((s,p)=> s + (Number(p.amount)||0), 0);
+}
+// Confirmed Value, Total Paid, Remaining Balance and a derived Payment
+// Status — always computed from the project record + ledger, never stored.
+// Payment Status is derived from Total Paid vs Project Value ONLY — it is
+// deliberately never influenced by Project Status (a separate axis, see
+// PROJECT_STAGES): "In Development" + "Partially Paid" is a valid, common
+// combination.
+// Payments are floats (e.g. 40.98 + 69.00), and summing them in JS can land
+// a hair off the exact cent value (109.97999999999999 instead of 109.98) —
+// invisible once moneyPrecise() rounds it to 2 decimals for display ("$109.98"), but a raw
+// `remaining > 0` / `totalPaid >= confirmedValue` comparison against that
+// un-rounded float saw the leftover ~1e-14 and never called it Fully Paid.
+// Half a cent is far smaller than any real partial payment, so absorbing it
+// here can't misclassify a genuine underpayment as Fully Paid.
+const PAYMENT_STATUS_EPSILON = 0.005;
+function paymentSummaryFor(projectId){
+  const proj = DB.find('projects', projectId);
+  const confirmedValue = proj ? (Number(proj.confirmedValue)||0) : 0;
+  const totalPaid = totalPaidForProject(projectId);
+  const remaining = Math.max(0, Math.round((confirmedValue - totalPaid) * 100) / 100);
+  let status = 'Not Paid';
+  if(totalPaid <= PAYMENT_STATUS_EPSILON) status = 'Not Paid';
+  else if(totalPaid < confirmedValue - PAYMENT_STATUS_EPSILON) status = 'Partially Paid';
+  else status = 'Fully Paid'; // totalPaid >= confirmedValue - EPSILON, i.e. fully covers the project value (or overpays it)
+  const lastPayment = paymentsForProject(projectId).slice(-1)[0] || null;
+  return { confirmedValue, totalPaid, remaining, status, lastPayment };
+}
+// "1st Payment", "2nd Payment", "3rd Payment", "4th Payment"... — purely a
+// display label suggestion, never used for calculation. Counts ALL ledger
+// entries ever recorded for the project (including voided ones) so a voided
+// payment's number is never reused by a later payment.
+function ordinalLabel(n){
+  const s = ['th','st','nd','rd'];
+  const v = n % 100;
+  return n + (s[(v-20)%10] || s[v] || s[0]) + ' Payment';
+}
+function nextPaymentNumberLabel(projectId){
+  const count = DB.all('payments').filter(p=>p.projectId===projectId).length;
+  return ordinalLabel(count + 1);
+}
+// `invoiceId` is OPTIONAL and defaults to null — every existing call site
+// (Project View's Record Payment) that doesn't pass it keeps recording a
+// perfectly ordinary unlinked payment, byte-identical to before the
+// Invoices module existed.
+async function recordPaymentEntry({ projectId, paymentNumber, amount, date, method, type, reference, note, userName, invoiceId=null }){
+  const rec = {
+    id: null,                               // assigned by the server
+    projectId,
+    paymentNumber: paymentNumber || nextPaymentNumberLabel(projectId),
+    amount: Number(amount)||0, date, method, type,
+    reference: reference || '', note: note||'',
+    recordedBy: userName, createdAt: new Date().toISOString(),
+    voided: false, voidedBy: null, voidedAt: null, voidReason: null,
+    invoiceId: invoiceId || null,
+  };
+  const r = await DB.create('payments', rec);
+  return r.ok ? { ok:true, record:r.record } : r;
+}
+
+// Edits an existing payment IN PLACE — history is never silently
+// overwritten: the caller (payments.js) always logs a
+// "Payment updated from $X to $Y by [user]"-style Activity Log entry with
+// the before/after values. Founder/Admin only — enforced by the UI layer
+// (canEditPayments()) and re-checked here as a second line of defense.
+async function updatePaymentEntry(paymentId, patch){
+  const rec = DB.find('payments', paymentId);
+  if(!rec) return { ok:false, userMessage:'That payment no longer exists. Please refresh the page.' };
+  Object.assign(rec, patch);
+  const r = await DB.update('payments', rec);
+  return r;
+}
+
+// Voids (never hard-deletes) a payment. Voided entries stay in the ledger
+// permanently for audit purposes but are excluded from every Total
+// Paid / Remaining / Payment Status calculation (see paymentsForProject).
+async function voidPaymentEntry(paymentId, { voidedBy, reason }){
+  const rec = DB.find('payments', paymentId);
+  if(!rec) return { ok:false, userMessage:'That payment no longer exists. Please refresh the page.' };
+  // who/when are set by the server from the signed-in user; the browser only sends the reason
+  return DB.voidPayment(paymentId, reason || '');
+}
+
+/* ---------------------------------------------------------------------- */
+/* REAL BizWeb KH client data (Session 5 import)                          */
+/* Extracted from Desktop/BizWeb KH/Client/ (C001–C044) — every quotation,*/
+/* invoice and deposit-record evidence document was read individually.    */
+/* No value below was invented: quotedValue/confirmedValue/amountCollected*/
+/* /remainingBalance are null unless a source document explicitly states  */
+/* them. leadStatus is 'Confirmed' ONLY when explicit deposit/invoice     */
+/* payment evidence exists in the client's own documents — never from a   */
+/* quotation alone, a folder's existence, or the pre-supplied historical  */
+/* "closed" list (that list was used only as a cross-check; three of its  */
+/* ten entries — C017, C019, C040 — are flagged historicalListConflict:   */
+/* true because their own folder evidence does NOT support Confirmed).    */
+/* See REAL_DATA_IMPORT_REVIEW.md for the full per-client evidence table. */
+/* ---------------------------------------------------------------------- */
+const REAL_CLIENTS = [
+  {
+    "code": "C001",
+    "clientName": "Phat Sopheak",
+    "businessName": "International Institute Academy (IIA Education Cambodia)",
+    "industry": "School / Education",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "Website",
+    "quotedValue": 110.28,
+    "confirmedValue": 110.28,
+    "leadStatus": "Confirmed",
+    "evidenceStrength": "High",
+    "needsManualReview": false,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C001-IIA-20260612",
+    "quotationDateRaw": "13 June 2026",
+    "createdAt": "2026-06-13",
+    "invoiceNumber": "BW-INV-C001-IIA-20260629",
+    "domain": "iia-edu.com",
+    "expectedDelivery": "3 - 5 working days (per quotation)",
+    "confirmedFunctions": [
+      "Homepage",
+      "School information",
+      "Program section",
+      "Student activities",
+      "Gallery",
+      "Contact",
+      "Map",
+      "Inquiry form",
+      "Mobile responsive design",
+      "Basic SEO",
+      "Domain Name Registration - iia-edu.com (1 year)",
+      "Hosting Setup (free 1st year promotion)",
+      "Basic Content Update Support (30 days after publishing)"
+    ],
+    "sourceFiles": [
+      "C001 - IIA Edu__BizWeb_KH_Invoice_IIA_Education_C001.txt",
+      "C001 - IIA Edu__BizWeb_KH_Quotation_IIA_Education_C001.txt"
+    ],
+    "notes": "Invoice total ($110.28) matches quotation total exactly; invoice confirms full payment received and website live.",
+    "amountCollected": 110.28,
+    "remainingBalance": 0.0,
+    "paymentStatus": "Fully Paid",
+    "projectStage": "Completed"
+  },
+  {
+    "code": "C002",
+    "clientName": "Mr. Phavy Hang",
+    "businessName": "Lymba Seven Star Translation",
+    "industry": "Professional Services",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "Website",
+    "quotedValue": 110.28,
+    "confirmedValue": 110.28,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Medium",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C002-LYMBA-20260615",
+    "quotationDateRaw": "16 June 2026",
+    "createdAt": "2026-06-16",
+    "invoiceNumber": null,
+    "domain": "lymbasevenstartranslation.com",
+    "expectedDelivery": "3 - 5 working days",
+    "confirmedFunctions": [
+      "Starter Website Package - Translation Company Website",
+      "Home, About, Document Translation Service, Interpretation Service, Conference Equipment pages",
+      "Supported languages, sectors served, why choose us, process, FAQ, contact",
+      "Mobile Responsive, Basic SEO, 2 Revision Rounds",
+      "Domain Name Registration - lymbasevenstartranslation.com (1 year)",
+      "Free 1-year Hosting (promotion)",
+      "Free 1-month basic content edit support after launch"
+    ],
+    "sourceFiles": [
+      "C002 - Lymba Seven Star Translation__Final_BizWeb_KH_Quotation_Lymba_Seven_Star_Translation_C002.txt"
+    ],
+    "notes": "Only a quotation exists; no invoice or payment evidence found.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C003",
+    "clientName": "Master Sarat (Loak Kru Sarat)",
+    "businessName": "Feng Shui Consultation (Hong Suy)",
+    "industry": "Professional Services",
+    "projectType": "Other",
+    "projectTypeRaw": "Personal Brand Website",
+    "quotedValue": null,
+    "confirmedValue": null,
+    "leadStatus": "Demo Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": null,
+    "quotationDateRaw": null,
+    "createdAt": null,
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": null,
+    "confirmedFunctions": [],
+    "sourceFiles": [
+      "folder listing only — feng-shui-demo.html, profile/name-card images"
+    ],
+    "notes": "No quotation, invoice, or written evidence found — only a demo website file and personal photos/name card exist. Needs Manual Review.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C004",
+    "clientName": "Mr. Da Sophann",
+    "businessName": "Da Sophann Dental Clinic",
+    "industry": "Clinic / Healthcare",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "Website",
+    "quotedValue": 110.28,
+    "confirmedValue": 110.28,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Medium",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C004-DASOPHANN-20260622",
+    "quotationDateRaw": "23 June 2026",
+    "createdAt": "2026-06-23",
+    "invoiceNumber": null,
+    "domain": "dasophanndental.com",
+    "expectedDelivery": "3 - 5 working days",
+    "confirmedFunctions": [
+      "Starter Website Package - Dental/Medical Clinic Website Customization",
+      "Home, About Clinic, Dental Services, Why Choose Us, Appointment Process, FAQ, Contact pages",
+      "Contact/Telegram button, Call button, Service cards, Basic appointment inquiry section",
+      "Mobile Responsive, Basic SEO, 2 Revision Rounds",
+      "Domain Name Registration - dasophanndental.com (1 year)",
+      "Free 1-year Hosting (promotion)",
+      "Free 1-month basic content edit support after launch"
+    ],
+    "sourceFiles": [
+      "C004 - ពេទ្យធ្មេញ ដា​ សុផាន់__Final_BizWeb_KH_Quotation_Da_Sophann_Dental_C004.txt"
+    ],
+    "notes": "Only a quotation exists; no invoice or payment evidence found.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C005",
+    "clientName": null,
+    "businessName": "Marvel Dental Clinic",
+    "industry": "Clinic / Healthcare",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "Website",
+    "quotedValue": 110.98,
+    "confirmedValue": 110.98,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Medium",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C005-MARVEL-20260622",
+    "quotationDateRaw": "23 June 2026",
+    "createdAt": "2026-06-23",
+    "invoiceNumber": null,
+    "domain": "marveldental.clinic",
+    "expectedDelivery": "3 - 5 working days",
+    "confirmedFunctions": [
+      "Starter Website Package - Dental Clinic/Orthodontic, Implant & Aesthetic Center Website Customization",
+      "Home, About Clinic, Services, Clinic Atmosphere, Why Choose Us, Appointment Process, FAQ, Contact pages",
+      "Contact/Telegram button, Call button, Service cards, Basic appointment inquiry section",
+      "Mobile Responsive, Basic SEO, 2 Revision Rounds",
+      "Domain Name Registration - marveldental.clinic (1 year)",
+      "Free 1-year Hosting (promotion)",
+      "Free 1-month basic content edit support after launch"
+    ],
+    "sourceFiles": [
+      "C005 - Marvel Dental Clinic__Final_BizWeb_KH_Quotation_Marvel_Dental_Clinic_C005.txt"
+    ],
+    "notes": "Only a quotation exists; no invoice or payment evidence found.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C006",
+    "clientName": null,
+    "businessName": "Raamaid Cambodia (RCIA)",
+    "industry": "School / Education",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "Website",
+    "quotedValue": 109.98,
+    "confirmedValue": 109.98,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Medium",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C006-RCIA-20260624",
+    "quotationDateRaw": "25 June 2026",
+    "createdAt": "2026-06-25",
+    "invoiceNumber": null,
+    "domain": "rcia-edu.com",
+    "expectedDelivery": "3 - 5 working days",
+    "confirmedFunctions": [
+      "Starter Website Package - School/Education Website Customization",
+      "Home, About School, Study Programs, Student Activities, School Photos, Why Choose Us, Inquiry Form, Contact pages",
+      "Contact/Telegram button, Call button, Study program cards, Basic parent inquiry section",
+      "Mobile Responsive, Basic SEO, 2 Revision Rounds",
+      "Multilingual content: Khmer + English + Chinese as provided",
+      "Domain Name Registration - rcia-edu.com (1 year)",
+      "Free 1-year Hosting (promotion)",
+      "Free 1-month basic content edit support after launch"
+    ],
+    "sourceFiles": [
+      "C006 - Raamaid Cambodia__Final_BizWeb_KH_Quotation_Raamaid_Cambodia_RCIA_C006.txt"
+    ],
+    "notes": "Only a quotation exists; no invoice or payment evidence found.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C007",
+    "clientName": null,
+    "businessName": "ACE K Clinic",
+    "industry": "Clinic / Healthcare",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "Website",
+    "quotedValue": 110.28,
+    "confirmedValue": 110.28,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C007-ACEK-20260624",
+    "quotationDateRaw": "24 June 2026",
+    "createdAt": "2026-06-24",
+    "invoiceNumber": null,
+    "domain": "acekclinic.com",
+    "expectedDelivery": "3 - 5 working days",
+    "confirmedFunctions": [
+      "Starter Website Package - Clinic/Healthcare Service Website Customization",
+      "Home, About Clinic, Services, Clinic Atmosphere, Why Choose Us, Appointment Process, FAQ, Contact pages",
+      "Contact/Telegram button, Call button, Service cards, Basic appointment inquiry section",
+      "Mobile Responsive, Basic SEO, 2 Revision Rounds",
+      "Bilingual content: English + Korean",
+      "Domain Name Registration - www.acekclinic.com (1 year)",
+      "Free 1-year Hosting (promotion)",
+      "Free 1-month basic content edit support after launch"
+    ],
+    "sourceFiles": [
+      "C007 - ACE K Clinic__Final_BizWeb_KH_Quotation_ACE_K_Clinic_C007.txt"
+    ],
+    "notes": "Thin document, no client personal name, no invoice/payment evidence, no signed acceptance.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C008",
+    "clientName": null,
+    "businessName": "SAFEMOVE EXPRESS",
+    "industry": "Logistics / Delivery",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "Website",
+    "quotedValue": 99.0,
+    "confirmedValue": 99.0,
+    "leadStatus": "Confirmed",
+    "evidenceStrength": "High",
+    "needsManualReview": false,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C008-SAFEMOVE-20260625",
+    "quotationDateRaw": "26 June 2026",
+    "createdAt": "2026-06-26",
+    "invoiceNumber": "BW-INV-C008-SAFEMOVE-20260629",
+    "domain": "safemoveexpress.com",
+    "expectedDelivery": "3 - 5 working days (quotation); invoice shows Draft Updated / Final Website Pending",
+    "confirmedFunctions": [
+      "Starter Website Package - Logistics/Delivery Website Customization",
+      "Home, About, Services, Why Choose Us, Business Solutions, Fleet/Operations, How It Works, Contact pages",
+      "Contact/Call buttons, Google Map link, service cards, basic inquiry section",
+      "Mobile Responsive, Basic SEO, 2 Revision Rounds",
+      "Existing domain (safemoveexpress.com) connection, no purchase fee",
+      "Free 1-year Hosting (promotion)",
+      "Free 1-month basic content edit support after launch"
+    ],
+    "sourceFiles": [
+      "C008 - SAFEMOVE EXPRESS__BizWeb_KH_Invoice_SAFEMOVE_EXPRESS_C008_Deposit.txt",
+      "C008 - SAFEMOVE EXPRESS__Final_BizWeb_KH_Quotation_SAFEMOVE_EXPRESS_C008.txt"
+    ],
+    "notes": "Invoice shows $30.00 deposit received against $99.00 subtotal, balance $69.00 due; project in progress.",
+    "amountCollected": 30.0,
+    "remainingBalance": 69.0,
+    "paymentStatus": "Partially Paid",
+    "projectStage": "In Development"
+  },
+  {
+    "code": "C009",
+    "clientName": null,
+    "businessName": "Melvin Dental Care",
+    "industry": "Clinic / Healthcare",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "Website",
+    "quotedValue": 99.0,
+    "confirmedValue": 99.0,
+    "leadStatus": "Confirmed",
+    "evidenceStrength": "High",
+    "needsManualReview": false,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C009-MELVIN-20260626",
+    "quotationDateRaw": "26 June 2026",
+    "createdAt": "2026-06-26",
+    "invoiceNumber": "BW-INV-C009-MELVIN-20260628",
+    "domain": "melvindentalcare.com",
+    "expectedDelivery": "3 - 5 working days (quotation); invoice shows Demo Completed / Final Customization Pending",
+    "confirmedFunctions": [
+      "Starter Website Package - Dental Clinic Website Customization",
+      "Home, About Clinic, Services, Promotion, Photos/Care, Why Choose Us, Appointment/Contact Form, Contact pages",
+      "Contact/Telegram button, Call button, Map button, Service cards, Promotion section, Basic appointment/contact section",
+      "Mobile Responsive, Basic SEO, 2 Revision Rounds",
+      "Multilingual content: Khmer + English + Chinese",
+      "Existing domain (melvindentalcare.com) connection, no purchase fee",
+      "Free 1-year Hosting (promotion)",
+      "Free 1-month basic content edit support after launch"
+    ],
+    "sourceFiles": [
+      "C009 - Melvin Dental Care__BizWeb_KH_Invoice_Melvin_Dental_Care_C009.txt",
+      "C009 - Melvin Dental Care__Final_BizWeb_KH_Quotation_Melvin_Dental_Care_C009.txt"
+    ],
+    "notes": "Invoice total ($99.00) matches quotation total and confirms full payment received; final customization still in progress.",
+    "amountCollected": 99.0,
+    "remainingBalance": 0.0,
+    "paymentStatus": "Fully Paid",
+    "projectStage": "Completed"
+  },
+  {
+    "code": "C010",
+    "clientName": null,
+    "businessName": "Kie Fepro Cambodia",
+    "industry": "Professional Services",
+    "projectType": "Other",
+    "projectTypeRaw": "Email System",
+    "quotedValue": 60.0,
+    "confirmedValue": 60.0,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Medium",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C010-KIE-FEPRO-20260630",
+    "quotationDateRaw": "30 June 2026",
+    "createdAt": "2026-06-30",
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": "3 - 4 working days (after domain/DNS access is ready)",
+    "confirmedFunctions": [
+      "Standard Email Setup Package - around 10 business email accounts",
+      "Create ~10 business email accounts",
+      "Connect one selected domain with email system",
+      "Set MX / SPF / DKIM DNS records",
+      "Test sending and receiving email",
+      "Basic login and usage guidance",
+      "Domain/DNS connection support"
+    ],
+    "sourceFiles": [
+      "C010 - Kei Fepro Cambodia__BizWeb_KH_Quotation_KieFepro_Email_System_C010.txt"
+    ],
+    "notes": "Only a quotation exists (Email System Setup, not a website project); no invoice/payment evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C011",
+    "clientName": null,
+    "businessName": "Bright Brain School",
+    "industry": "School / Education",
+    "projectType": "Other",
+    "projectTypeRaw": "Admin Dashboard",
+    "quotedValue": 399.0,
+    "confirmedValue": 399.0,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Medium",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C011-BRIGHTBRAIN-20260630",
+    "quotationDateRaw": "1 Jul 2026",
+    "createdAt": "2026-07-01",
+    "invoiceNumber": null,
+    "domain": "brightbrain.edu.kh",
+    "expectedDelivery": "10 - 15 working days",
+    "confirmedFunctions": [
+      "Multi-page School Website using client logo, colors, images, Khmer + English content",
+      "Pages: Home, About, Mission & Vision, Programs, Staff, Gallery, News & Events, Contact",
+      "Basic Admin Dashboard: admin login to manage News/Events, Gallery, Program content, and basic school information",
+      "Contact/Inquiry Form, Mobile Responsive, Basic SEO, 2 Revision Rounds",
+      "Domain connection support (brightbrain.edu.kh, client-provided/purchased)",
+      "First-year basic hosting/backend/database support included"
+    ],
+    "sourceFiles": [
+      "C011 - Bright Brain School__BizWeb_KH_Quotation_Bright_Brain_School_C011_Admin_Dashboard.txt"
+    ],
+    "notes": "Only a quotation exists; 50/50 payment schedule specified but no invoice or payment confirmation document provided.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C012",
+    "clientName": "Golden River Restaurant",
+    "businessName": "Golden River Restaurant",
+    "industry": "Restaurant / Cafe",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "Restaurant Website (two competing options: Starter static vs Website + Online Reservation System & Admin Dashboard)",
+    "quotedValue": null,
+    "confirmedValue": null,
+    "leadStatus": "Negotiation",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C012-GRR-20260802 (Starter) / BW-Q-C012-GRR-RES-20260802 (Reservation System)",
+    "quotationDateRaw": "02 Aug 2026",
+    "createdAt": "2026-08-02",
+    "invoiceNumber": null,
+    "domain": "goldenriver.restaurant",
+    "expectedDelivery": null,
+    "confirmedFunctions": [],
+    "sourceFiles": [
+      "C012 - Golden_River_Restaurant_C012_Starter.txt",
+      "C012 - Golden_River_Restaurant_C012_Reservation_System.txt"
+    ],
+    "notes": "Two unresolved options same day, no signed acceptance, no invoice: (1) Starter Total $110.98; (2) Starter+Reservation System Total $410.98. confirmedValue left null.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C013",
+    "clientName": "CEO Center",
+    "businessName": "CEO Center",
+    "industry": "Real Estate / Property",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "One-Page Real Estate Website (Premium Mixed-Use Property Landing Page)",
+    "quotedValue": 109.98,
+    "confirmedValue": 109.98,
+    "leadStatus": "Confirmed",
+    "evidenceStrength": "High",
+    "needsManualReview": false,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C013-CEO-20260704",
+    "quotationDateRaw": "04 July 2026",
+    "createdAt": "2026-07-04",
+    "invoiceNumber": "BW-INV-C013-CEO-20260707",
+    "domain": "ceocentercambodia.com",
+    "expectedDelivery": null,
+    "confirmedFunctions": [
+      "One-page premium website with overview, video, project sections (Residences, Wyndham Hotel Units, Office Units, Amenities)",
+      "Floor plans preview",
+      "Payment plan / pricing display",
+      "Due diligence section",
+      "Location and inquiry form",
+      "Mobile responsive design and basic SEO"
+    ],
+    "sourceFiles": [
+      "C013 - CEO Center Apartment Building__BizWeb_KH_Quotation_CEO_Center_C013.txt",
+      "C013 - CEO Center Apartment Building__BizWeb_KH_Invoice_CEO_Center_C013.txt"
+    ],
+    "notes": "Quotation total matches invoice total exactly, invoice marked PAID IN FULL.",
+    "amountCollected": 109.98,
+    "remainingBalance": 0.0,
+    "paymentStatus": "Fully Paid",
+    "projectStage": "Completed"
+  },
+  {
+    "code": "C014",
+    "clientName": "The Nail Room Salon",
+    "businessName": "The Nail Room Salon",
+    "industry": "Salon / Beauty",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "Starter Website Package (Nail Salon static informational website)",
+    "quotedValue": 109.98,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C014-NAIL-20260703",
+    "quotationDateRaw": "04 July 2026",
+    "createdAt": "2026-07-04",
+    "invoiceNumber": null,
+    "domain": "thenailroomsalonkh.com",
+    "expectedDelivery": "3 - 5 Working days",
+    "confirmedFunctions": [],
+    "sourceFiles": [
+      "C014 - The Nail Room Salon__BizWeb_KH_Quotation_The_Nail_Room_Salon_C014.txt"
+    ],
+    "notes": "Only a quotation exists; no invoice or acceptance evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C015",
+    "clientName": null,
+    "businessName": "HKC TREE INTERNATIONAL SCHOOL",
+    "industry": "School / Education",
+    "projectType": "Other",
+    "projectTypeRaw": "Website (unspecified — no quotation)",
+    "quotedValue": null,
+    "confirmedValue": null,
+    "leadStatus": "Demo Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": null,
+    "quotationDateRaw": null,
+    "createdAt": null,
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": null,
+    "confirmedFunctions": [],
+    "sourceFiles": [
+      "folder listing only — demo folder, logo/photos, empty School Info.txt"
+    ],
+    "notes": "School Info.txt exists but is empty; a demo folder (c015-hkc-tree-school-demo) exists but no quotation/invoice. Needs Manual Review.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C016",
+    "clientName": "SE4HC Cambodia",
+    "businessName": "Secondary Education for Human Capital Competitiveness Project (SE4HC)",
+    "industry": "School / Education",
+    "projectType": "Other",
+    "projectTypeRaw": "Education/Government proposal system website (Full System vs Basic Portal)",
+    "quotedValue": null,
+    "confirmedValue": null,
+    "leadStatus": "Negotiation",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C016-SE4HC-20260708 / BW-Q-C016-SE4HC-BASIC-20260712",
+    "quotationDateRaw": "9 Jul 2026 / 12 Jul 2026",
+    "createdAt": "2026-07-09",
+    "invoiceNumber": null,
+    "domain": "se4hc.com",
+    "expectedDelivery": null,
+    "confirmedFunctions": [],
+    "sourceFiles": [
+      "C016 - SE4HC Cambodia__BizWeb_KH_Quotation_SE4HC_Cambodia_C016.txt",
+      "C016 - SE4HC Cambodia__BizWeb_KH_Quotation_SE4HC_Cambodia_C016_Basic_Portal.txt"
+    ],
+    "notes": "Two unresolved options: Full System $1,710.28 vs Basic Portal $710.28, no invoice/acceptance.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C017",
+    "clientName": "ODOM Prestige",
+    "businessName": "ODOM Prestige",
+    "industry": "Real Estate / Property",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "One-Page Static Real Estate Website - Starter Website Package",
+    "quotedValue": 110.28,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": true,
+    "quotationNumber": "BW-Q-C017-ODOM-20260712",
+    "quotationDateRaw": "12 July 2026",
+    "createdAt": "2026-07-12",
+    "invoiceNumber": null,
+    "domain": "odomprestige.com",
+    "expectedDelivery": "3 - 5 Working days",
+    "confirmedFunctions": [],
+    "sourceFiles": [
+      "C017 - ODOM Project__BizWeb_KH_Quotation_ODOM_Prestige_C017.txt"
+    ],
+    "notes": "HISTORICAL LIST CONFLICT: was on the previously-confirmed-closed list but only a $110.28 Starter quotation exists with no invoice, deposit, or signed acceptance. Flag for manual review.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C018",
+    "clientName": "Sek Meas Grains & Edible Oils Co., Ltd.",
+    "businessName": "Sek Meas Grains & Edible Oils Co., Ltd.",
+    "industry": "Other",
+    "projectType": "Other",
+    "projectTypeRaw": "Product Catalogue Website + Product Management Admin Dashboard",
+    "quotedValue": 610.28,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C018-SEKMEAS-20260715",
+    "quotationDateRaw": "15 Jul 2026",
+    "createdAt": "2026-07-15",
+    "invoiceNumber": null,
+    "domain": "sekmeasgrainsedibleoils.com",
+    "expectedDelivery": "15 - 20 Working days",
+    "confirmedFunctions": [],
+    "sourceFiles": [
+      "C018 - Sek Meas Grains & Edible Oils Co., Ltd__BizWeb_KH_Quotation_Sek_Meas_C018_final.txt"
+    ],
+    "notes": "Only a quotation exists despite filename 'final'; no invoice/payment evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C019",
+    "clientName": "Samantha",
+    "businessName": "Food Business (Name Pending Confirmation) / Existing Business Website",
+    "industry": "Restaurant / Cafe",
+    "projectType": "Other",
+    "projectTypeRaw": "Three unresolved quotations: Food Business Website; Food Business + Ordering + Nutrition; Existing Website Elementor Improvement",
+    "quotedValue": null,
+    "confirmedValue": null,
+    "leadStatus": "Negotiation",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": true,
+    "quotationNumber": "BW-Q-C019-FOOD-WEB-20260715 / BW-Q-C019-FOOD-SYSTEM-20260715 / BW-Q-C019-ELEMENTOR-20260804",
+    "quotationDateRaw": "16 July 2026 / 4 August 2026",
+    "createdAt": "2026-07-16",
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": null,
+    "confirmedFunctions": [],
+    "sourceFiles": [
+      "C019 - Samantha__BizWeb_KH_Quotation_Samantha_C019_Option1_Website_Only.txt",
+      "C019 - Samantha__BizWeb_KH_Quotation_Samantha_C019_Option2_Website_Order_Nutrition_System.txt",
+      "C019 - Samantha__BizWeb_KH_Quotation_C019_Elementor_Improvement.txt"
+    ],
+    "notes": "HISTORICAL LIST CONFLICT: was on the previously-confirmed-closed list but three separate unresolved quotations exist with no invoice or signed acceptance for any. Flag for manual review.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C020",
+    "clientName": "Little Learners Daycare",
+    "businessName": "Little Learners Cambodia / Little Learners Daycare",
+    "industry": "School / Education",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "Starter Website Package - Daycare & Pre-School Website",
+    "quotedValue": 99.0,
+    "confirmedValue": 99.0,
+    "leadStatus": "Confirmed",
+    "evidenceStrength": "High",
+    "needsManualReview": false,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C020-LITTLE-LEARNERS-20260717",
+    "quotationDateRaw": "17 July 2026",
+    "createdAt": "2026-07-17",
+    "invoiceNumber": "BW-INV-C020-LITTLELEARNERS-20260721",
+    "domain": null,
+    "expectedDelivery": null,
+    "confirmedFunctions": [
+      "Homepage, daycare information, learning programs, facilities, gallery",
+      "Parent information section",
+      "Contact buttons",
+      "Mobile responsive design and basic SEO",
+      "Website customization based on client feedback"
+    ],
+    "sourceFiles": [
+      "C020 - Little Learner__BizWeb_KH_Quotation_Little_Learners_C020.txt",
+      "C020 - Little Learner__BizWeb_KH_Invoice_Little_Learners_Daycare_C020_Deposit.txt"
+    ],
+    "notes": "Quotation total matches invoice; deposit paid evidence found.",
+    "amountCollected": 29.7,
+    "remainingBalance": 69.3,
+    "paymentStatus": "Partially Paid",
+    "projectStage": "In Development"
+  },
+  {
+    "code": "C021",
+    "clientName": "ROCKRETE (CAMBODIA) CO., LTD",
+    "businessName": "ROCKRETE (CAMBODIA) CO., LTD",
+    "industry": "Construction / Property Development",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "Starter Website Package (Company services website)",
+    "quotedValue": 99.0,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C021-ROCKRETE-O1-20260717",
+    "quotationDateRaw": "17 July 2026",
+    "createdAt": "2026-07-17",
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": "3 - 5 Working days",
+    "confirmedFunctions": [],
+    "sourceFiles": [
+      "C021 - ROCKRETE CAMBODIA CO., LTD__BizWeb_KH_Quotation_ROCKRETE_C021_Option1_Website.txt"
+    ],
+    "notes": "Only Option 1 file provided; no invoice/acceptance.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C022",
+    "clientName": "Hearing Solution Cambodia",
+    "businessName": "Hearing Solution Cambodia",
+    "industry": "Clinic / Healthcare",
+    "projectType": "Booking System",
+    "projectTypeRaw": "Website + OTP Booking System + Basic Admin Dashboard",
+    "quotedValue": 300.0,
+    "confirmedValue": 300.0,
+    "leadStatus": "Confirmed",
+    "evidenceStrength": "High",
+    "needsManualReview": false,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C022-HSC-BOOKING-20260731",
+    "quotationDateRaw": "30 Jul 2026",
+    "createdAt": "2026-07-30",
+    "invoiceNumber": "BW-INV-C022-HSC-20260731",
+    "domain": "hearingsolutioncambodia.com",
+    "expectedDelivery": "12-18 working days from project start",
+    "confirmedFunctions": [
+      "Professional public website (Home, About, Services, Products, Hearing Aid Styles, Why Choose Us, FAQ, Appointment, Contact)",
+      "Customer appointment/booking request form with 6-digit SMS OTP verification",
+      "Booking reference generation with Pending Confirmation status",
+      "Protected admin login and dashboard (booking summary, list/detail, search, filter)",
+      "Booking status updates and internal staff notes",
+      "Basic booking report up to 3 months with CSV export",
+      "Backend/API and database setup, secure admin authentication",
+      "Domain hearingsolutioncambodia.com (1 year)",
+      "30 days minor bug-fix support after launch"
+    ],
+    "sourceFiles": [
+      "C022 - Hearing Solution Cambodia__BizWeb_KH_Invoice_Hearing_Solution_C022_Deposit.txt",
+      "C022 - Hearing Solution Cambodia__BizWeb_KH_Quotation_Hearing_Solution_C022_Final.txt"
+    ],
+    "notes": "Deposit invoice and final quotation cross-check consistently; development in progress.",
+    "amountCollected": 100.0,
+    "remainingBalance": 200.0,
+    "paymentStatus": "Partially Paid",
+    "projectStage": "In Development"
+  },
+  {
+    "code": "C023",
+    "clientName": "SafeMove Express",
+    "businessName": "SafeMove Express",
+    "industry": "Logistics / Delivery",
+    "projectType": "Mobile App / Advanced Platform",
+    "projectTypeRaw": "Mobile App UX/UI Redesign & Interactive Clickable Prototype",
+    "quotedValue": 399.0,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C023-SAFEMOVE-APP-20260721",
+    "quotationDateRaw": "22 July 2026",
+    "createdAt": "2026-07-22",
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": "10-15 working days",
+    "confirmedFunctions": [
+      "Redesign of key app screens: Login, Register, Home, Express Delivery, Pickup & Drop-off, Item Details, Vehicle, Estimate, Order Review, Confirmation, Tracking, Orders, Promotions, Alerts, Profile",
+      "Complete SafeMove visual system",
+      "Clickable prototype entry screens for Laundry, Mart and Food services",
+      "Clickable HTML/CSS/JavaScript prototype and screen-gallery presentation",
+      "Up to 2 revision rounds"
+    ],
+    "sourceFiles": [
+      "C023 - SAFEMOVE EXPRESS MOBILE APP__BizWeb_KH_Quotation_SafeMove_Mobile_App_UXUI_C023.txt"
+    ],
+    "notes": "Only a quotation exists (UX/UI design + prototype scope only); no invoice/deposit evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C024",
+    "clientName": null,
+    "businessName": "S Rungreung",
+    "industry": "Unspecified",
+    "projectType": "Other",
+    "projectTypeRaw": "Unspecified (only marketing/social assets found)",
+    "quotedValue": null,
+    "confirmedValue": null,
+    "leadStatus": "New Lead",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": null,
+    "quotationDateRaw": null,
+    "createdAt": null,
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": null,
+    "confirmedFunctions": [],
+    "sourceFiles": [
+      "folder listing only — Facebook banner/page, logo, service post images"
+    ],
+    "notes": "No quotation, invoice, website, or written business description found — only social-media graphic assets. Needs Manual Review; industry could not be determined from available evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C025",
+    "clientName": "Kep Ocean Resort",
+    "businessName": "Kep Ocean Resort",
+    "industry": "Hotel / Resort / Guesthouse",
+    "projectType": "Booking System",
+    "projectTypeRaw": "Website + Villa Booking System + Management Dashboard",
+    "quotedValue": 909.98,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C025-KOR-BOOKING-20260724",
+    "quotationDateRaw": "25 Jul 2026",
+    "createdAt": "2026-07-25",
+    "invoiceNumber": null,
+    "domain": "kepoceanresort.com",
+    "expectedDelivery": "20-30 working days",
+    "confirmedFunctions": [
+      "Professional public resort website with 8 villa listings",
+      "Customer villa booking system with availability selection and booking reference",
+      "Management dashboard: booking overview/calendar, villa availability, guest records, payment tracking, basic reports",
+      "Domain kepoceanresort.com (1 year)"
+    ],
+    "sourceFiles": [
+      "C025 - Kep Ocean Resort__BizWeb_KH_Quotation_Kep_Ocean_Resort_C025_Booking_System.txt"
+    ],
+    "notes": "Only a quotation exists, unsigned; no deposit/invoice evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C026",
+    "clientName": null,
+    "businessName": "WellCare Pharmacy",
+    "industry": "Pharmacy",
+    "projectType": "Other",
+    "projectTypeRaw": "Pharmacy Website + Product Management Dashboard (client-review demo)",
+    "quotedValue": null,
+    "confirmedValue": null,
+    "leadStatus": "Demo Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": null,
+    "quotationDateRaw": null,
+    "createdAt": null,
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": null,
+    "confirmedFunctions": [
+      "Public pharmacy website",
+      "Admin product management dashboard",
+      "Telegram order-inquiry flow (no online payment)"
+    ],
+    "sourceFiles": [
+      "c026-pharmacy-demo/CLIENT-DEMO-LINKS.txt",
+      "pharmacy-product-catalogue/README.md"
+    ],
+    "notes": "A working frontend demo was built (per README, 'design and workflow demo', sample data only, no backend) but no quotation or invoice document exists in the folder. Needs Manual Review.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C027",
+    "clientName": null,
+    "businessName": "FELINE Beauty Clinic",
+    "industry": "Salon / Beauty",
+    "projectType": "Other",
+    "projectTypeRaw": "Website + Gallery Management Dashboard (client-review demo)",
+    "quotedValue": null,
+    "confirmedValue": null,
+    "leadStatus": "Demo Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": null,
+    "quotationDateRaw": null,
+    "createdAt": null,
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": null,
+    "confirmedFunctions": [
+      "Public marketing website",
+      "Private gallery-management dashboard"
+    ],
+    "sourceFiles": [
+      "feline-beauty-clinic/CLIENT-DEMO-LINKS.txt",
+      "feline-beauty-clinic/README.md"
+    ],
+    "notes": "A working frontend demo was built (per README, mock data only, no backend) but no quotation or invoice document exists in the folder. Needs Manual Review.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C028",
+    "clientName": "IEDS International School",
+    "businessName": "IEDS International School",
+    "industry": "School / Education",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "One-Page Static Website (Starter Package)",
+    "quotedValue": 137.47,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C028-IEDS-20260726",
+    "quotationDateRaw": "26 July 2026",
+    "createdAt": "2026-07-26",
+    "invoiceNumber": null,
+    "domain": "www.ieds.school",
+    "expectedDelivery": "3-5 working days",
+    "confirmedFunctions": [
+      "One-page layout matching branding/logo/colors",
+      "Sections: Home, About, Learning & Development, Programs, Digital Learning, School Life/Gallery, Admission CTA, Contact",
+      "Mobile responsive, basic SEO, 2 revision rounds",
+      "Domain www.ieds.school (1 year)"
+    ],
+    "sourceFiles": [
+      "C028 - IEDS International School__BizWeb_KH_Quotation_IEDS_International_School_C028.txt"
+    ],
+    "notes": "Only a quotation exists, unsigned; no deposit/invoice evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C029",
+    "clientName": "Luminara International School",
+    "businessName": "Luminara International School",
+    "industry": "School / Education",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "One-Page Static Website (Starter Package)",
+    "quotedValue": 110.28,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C029-LUMINARA-20260726",
+    "quotationDateRaw": "26 July 2026",
+    "createdAt": "2026-07-26",
+    "invoiceNumber": null,
+    "domain": "www.luminarainternationalschool.com",
+    "expectedDelivery": "3-5 working days",
+    "confirmedFunctions": [
+      "One-page layout matching branding/logo/colors",
+      "Sections: Home, About, Learning & Development, Programs, Digital Learning, School Life/Gallery, Admission CTA, Contact",
+      "Mobile responsive, basic SEO, 2 revision rounds",
+      "Domain www.luminarainternationalschool.com (1 year)"
+    ],
+    "sourceFiles": [
+      "C029 - Luminara International School__BizWeb_KH_Quotation_Luminara_International_School_C029.txt"
+    ],
+    "notes": "Only a quotation exists, unsigned; no deposit/invoice evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C030",
+    "clientName": "Cambodian Muslim Education and Humanitarian Association (CMEHA)",
+    "businessName": "CMEHA",
+    "industry": "NGO / Association",
+    "projectType": "Dynamic Website / CMS",
+    "projectTypeRaw": "Dynamic Website with Admin Dashboard",
+    "quotedValue": 399.0,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C030-CMEHA-20260729",
+    "quotationDateRaw": "29 July 2026",
+    "createdAt": "2026-07-29",
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": "10-15 working days",
+    "confirmedFunctions": [
+      "Responsive dynamic website: Home, About, Vision & Mission, Education Programs, Humanitarian Activities, Projects, News, Gallery, Partners, Contact",
+      "Admin login and dashboard to add/edit/delete/publish content",
+      "Content management, image upload, categories, search",
+      "Cloud hosting, database setup, SSL, basic backup for first year"
+    ],
+    "sourceFiles": [
+      "C030 - CMEHA__BizWeb_KH_Quotation_CMEHA_C030.txt"
+    ],
+    "notes": "Only a quotation exists, unsigned; no deposit/invoice evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C031",
+    "clientName": "Dr Ly Cheng Huy",
+    "businessName": "Dr Ly Cheng Huy",
+    "industry": "Clinic / Healthcare",
+    "projectType": "Mobile App / Advanced Platform",
+    "projectTypeRaw": "Website + Mobile Application + Admin Management Dashboard",
+    "quotedValue": 2810.28,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C031-DRLYCHENGHUY-20260731",
+    "quotationDateRaw": "31 Jul 2026",
+    "createdAt": "2026-07-31",
+    "invoiceNumber": null,
+    "domain": "www.drlychenghuy.com",
+    "expectedDelivery": "55-75 working days",
+    "confirmedFunctions": [
+      "Informative medical website with consultation, e-books, articles, videos",
+      "User mobile app: consultation booking with built-in one-to-one secure video consultation",
+      "Health articles, videos, content categories",
+      "E-Book store, purchase, subscription",
+      "Admin dashboard managing users/appointments/payments/video consultations/e-books/subscriptions",
+      "Domain www.drlychenghuy.com (1 year)"
+    ],
+    "sourceFiles": [
+      "C031 - Dr Ly Cheng Huy__BizWeb_KH_Quotation_Dr_Ly_Cheng_Huy_C031_Final_2799.txt"
+    ],
+    "notes": "Only a quotation exists despite filename Final_2799, unsigned; no deposit/invoice evidence. Project Fee described as a discounted one-time fee of $2,799.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C032",
+    "clientName": null,
+    "businessName": "BBIS International School",
+    "industry": "School / Education",
+    "projectType": "Other",
+    "projectTypeRaw": "Unspecified (only logo/reference images found)",
+    "quotedValue": null,
+    "confirmedValue": null,
+    "leadStatus": "New Lead",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": null,
+    "quotationDateRaw": null,
+    "createdAt": null,
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": null,
+    "confirmedFunctions": [],
+    "sourceFiles": [
+      "folder listing only — BBIS logo image, unrelated reference image"
+    ],
+    "notes": "No quotation, invoice, or written evidence found — only two reference images. Needs Manual Review.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C033",
+    "clientName": "C033 E-Commerce Client",
+    "businessName": "Supplement, Cosmetics & Makeup E-Commerce",
+    "industry": "Retail / E-Commerce",
+    "projectType": "E-Commerce Level 1",
+    "projectTypeRaw": "E-Commerce Website + Customer Account + Admin Dashboard (Full vs Essential options)",
+    "quotedValue": 2799.0,
+    "confirmedValue": null,
+    "leadStatus": "Negotiation",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C033-ECOMMERCE-FULL-20260803 / BW-Q-C033-ECOMMERCE-LITE-20260803",
+    "quotationDateRaw": "03 Aug 2026",
+    "createdAt": "2026-08-03",
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": "Full: 40-55 working days; Essential: 25-35 working days",
+    "confirmedFunctions": [],
+    "sourceFiles": [
+      "C033 - E-Commerce Website__BizWeb_KH_Quotation_C033_Ecommerce_Option_1_Full.txt",
+      "C033 - E-Commerce Website__BizWeb_KH_Quotation_C033_Ecommerce_Option_2_Essential.txt"
+    ],
+    "notes": "Two options no signal which chosen: Full $2,799.00, Essential $1,699.00. No proper client/company name given in either document.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C034",
+    "clientName": "Mr. Seyha",
+    "businessName": "Petroleum Products Business (To Be Confirmed)",
+    "industry": "Other",
+    "projectType": "Other",
+    "projectTypeRaw": "Petroleum Products Website + Basic Admin Dashboard",
+    "quotedValue": 399.0,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-PETRO-8472-20260804",
+    "quotationDateRaw": "5 Aug 2026",
+    "createdAt": "2026-08-05",
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": "10-15 working days",
+    "confirmedFunctions": [],
+    "sourceFiles": [
+      "C034 - Petroleum__BizWeb_KH_Quotation_Mr_Seyha_Petroleum_Admin_Dashboard.txt"
+    ],
+    "notes": "Only a quotation exists; business name explicitly marked To Be Confirmed; no invoice/acceptance evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C035",
+    "clientName": "Islamic Medical Relief for Cambodia Humanity Association",
+    "businessName": "Islamic Medical Relief for Cambodia Humanity Association (IMRCHA)",
+    "industry": "NGO / Association",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "NGO One-Page Static Website (Starter Package)",
+    "quotedValue": 106.48,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C035-IMRCHA-20260807",
+    "quotationDateRaw": "7 August 2026",
+    "createdAt": "2026-08-07",
+    "invoiceNumber": null,
+    "domain": "imrcha.org",
+    "expectedDelivery": "3-5 working days",
+    "confirmedFunctions": [],
+    "sourceFiles": [
+      "C035 - IMRCHA.org__BizWeb_KH_Quotation_IMRCHA_C035.txt"
+    ],
+    "notes": "Only a quotation exists; client signature blank; no payment evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C036",
+    "clientName": "Sampheap Guesthouse",
+    "businessName": "Sampheap Guesthouse",
+    "industry": "Hotel / Resort / Guesthouse",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "Guesthouse One-Page Static Website (Starter Package)",
+    "quotedValue": 110.28,
+    "confirmedValue": 110.28,
+    "leadStatus": "Confirmed",
+    "evidenceStrength": "High",
+    "needsManualReview": false,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C036-SAMPHEAP-20260807",
+    "quotationDateRaw": "7 August 2026",
+    "createdAt": "2026-08-07",
+    "invoiceNumber": "BW-INV-C036-20260813",
+    "domain": "sampheapguesthouse.com",
+    "expectedDelivery": "Completed / Published",
+    "confirmedFunctions": [
+      "One-page website: Home, About, Rooms & Facilities, Stay Packages, Travel Packages, Transportation Services, Explore Stung Treng, Gallery, Inquiry, Contact",
+      "English/Khmer language switch",
+      "Mobile responsive design, basic SEO",
+      "Domain registration: sampheapguesthouse.com (1 year)",
+      "Hosting included free year 1"
+    ],
+    "sourceFiles": [
+      "C036 - SAMPHEAP Guesthouse__BizWeb_KH_Quotation_Sampheap_Guesthouse_C036.txt",
+      "C036 - SAMPHEAP Guesthouse__BizWeb_KH_Invoice_Sampheap_Guesthouse_C036_Paid_Full.txt"
+    ],
+    "notes": "Quotation total matches Paid_Full invoice total exactly; website live. No discount applied.",
+    "amountCollected": 110.28,
+    "remainingBalance": 0.0,
+    "paymentStatus": "Fully Paid",
+    "projectStage": "Completed"
+  },
+  {
+    "code": "C037",
+    "clientName": "Ms. Kerena Khun",
+    "businessName": "NGO / Organization Name (To Be Confirmed)",
+    "industry": "NGO / Association",
+    "projectType": "Dynamic Website / CMS",
+    "projectTypeRaw": "NGO Website + Basic Content Management Dashboard",
+    "quotedValue": 399.0,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C037-5831-20260808",
+    "quotationDateRaw": "8 Aug 2026",
+    "createdAt": "2026-08-08",
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": "10-15 working days",
+    "confirmedFunctions": [],
+    "sourceFiles": [
+      "C037 - NGO Ms Kerena Khun__BizWeb_KH_Quotation_C037_Ms_Kerena_Khun_NGO_Website_CMS.txt"
+    ],
+    "notes": "Only a quotation exists; organization name explicitly To Be Confirmed; no payment evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C038",
+    "clientName": "Mr. Phearun",
+    "businessName": "Dental Clinic Name (To Be Confirmed)",
+    "industry": "Clinic / Healthcare",
+    "projectType": "Booking System",
+    "projectTypeRaw": "Dynamic Dental Website + Content Management + Booking & OTP System",
+    "quotedValue": 599.0,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C038-B599-9362-20260808",
+    "quotationDateRaw": "8 Aug 2026",
+    "createdAt": "2026-08-08",
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": "15-20 working days",
+    "confirmedFunctions": [],
+    "sourceFiles": [
+      "C038 - Mr Phearun Dental__BizWeb_KH_Quotation_C038_Mr_Phearun_Option4_Dynamic_Booking_599.txt"
+    ],
+    "notes": "Only Option4 quotation exists (of up to 4 options); clinic name To Be Confirmed; no payment evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C039",
+    "clientName": "Ms. Engly Khun",
+    "businessName": "Engly Khun Salon (To Be Confirmed)",
+    "industry": "Salon / Beauty",
+    "projectType": "Customer Management System",
+    "projectTypeRaw": "Customer Management + Staff Incentive Dashboard (Salon Management System)",
+    "quotedValue": 599.0,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C039-8391-20260815",
+    "quotationDateRaw": "15 Aug 2026",
+    "createdAt": "2026-08-15",
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": "12-15 working days",
+    "confirmedFunctions": [
+      "Role-based Login & Dashboard (Owner and Cashier/Admin access)",
+      "New Deal & Customer/VIP Management with search/autofill, visit/spending history",
+      "Normal and VIP/Package customers with purchase, top-up, balance tracking",
+      "Multi-Service & Incentive: multiple services per customer, different staff, $ or % discount",
+      "Separate Service Incentive and Sales Incentive calculated automatically",
+      "Transactions & Reports: search/filter, receipt, status tracking, audit log",
+      "Khmer default + English switch"
+    ],
+    "sourceFiles": [
+      "C039 - Saloon Ms Engly Khun__BizWeb_KH_Quotation_C039_Engly_Khun_Customer_Management_Dashboard_Final.txt",
+      "C039 - Saloon Ms Engly Khun__BizWeb_KH_Quotation_C039_Engly_Khun_Year_By_Year_Final_v2.txt"
+    ],
+    "notes": "Two versions of same quote, same total $599, both have blank client signature/date; no payment evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C040",
+    "clientName": "Norea Square Phnom Penh",
+    "businessName": "Norea Square Phnom Penh",
+    "industry": "Real Estate / Property",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "One-Page Static Website (Starter Package) - Condominium/Real Estate",
+    "quotedValue": 110.28,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": true,
+    "quotationNumber": "BW-Q-C040-NOREA-20260813",
+    "quotationDateRaw": "13 Aug 2026",
+    "createdAt": "2026-08-13",
+    "invoiceNumber": null,
+    "domain": "noreasquarephnompenh.com",
+    "expectedDelivery": "3-5 working days",
+    "confirmedFunctions": [
+      "One-Page Static Website: Home, Project Overview, About Project, Residences, Unit Types & Unit Plans, Amenities, Facilities, Location, Gallery, About Developer, Contact/Inquiry Form",
+      "YouTube video, Call button, Telegram button, Map button, unit cards, floor-plan preview, document download, gallery",
+      "Mobile Responsive, Basic SEO, 2 Revision Rounds",
+      "1 year domain (noreasquarephnompenh.com)"
+    ],
+    "sourceFiles": [
+      "C040 - noreasquarephnompenh.com__BizWeb_KH_Quotation_C040_Norea_Square_Phnom_Penh_Starter_99.txt"
+    ],
+    "notes": "HISTORICAL LIST CONFLICT: was on the previously-confirmed-closed list but only a $110.28 Starter quotation exists, Demo Preview Link TBC, client signature blank. Flag for manual review.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C041",
+    "clientName": "Ms. Somaly Thon",
+    "businessName": "Micro Insurance Company (To Be Confirmed)",
+    "industry": "Insurance / Finance",
+    "projectType": "Dynamic Website / CMS",
+    "projectTypeRaw": "Micro Insurance Website + Basic Content Management Dashboard",
+    "quotedValue": 399.0,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C041-D399-4517-20260813",
+    "quotationDateRaw": "13 Aug 2026",
+    "createdAt": "2026-08-13",
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": "10-15 working days",
+    "confirmedFunctions": [
+      "Multi-page micro-insurance company website (Khmer + English)",
+      "Pages: Home, About Us, Insurance Products, Benefits/Claims Information, Promotions, News/Updates, FAQ, Gallery, Contact Us",
+      "Basic Content Management Dashboard",
+      "Contact/Inquiry Form, Mobile Responsive, Basic SEO, 2 Revision Rounds"
+    ],
+    "sourceFiles": [
+      "C041 - Ms. Somaly Thon - Micro Insurance__BizWeb_KH_Quotation_C041_Ms_Somaly_Thon_Micro_Insurance_CMS_399.txt"
+    ],
+    "notes": "Only a quotation exists; company name and domain TBC; no payment evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C042",
+    "clientName": "Mr. Thearith Ret",
+    "businessName": "Home Use Tools E-Commerce (To Be Confirmed)",
+    "industry": "Retail / E-Commerce",
+    "projectType": "E-Commerce Level 1",
+    "projectTypeRaw": "E-Commerce Product Catalog Website + Simple Admin Dashboard",
+    "quotedValue": 500.0,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C042-5000-20260819",
+    "quotationDateRaw": "19 Aug 2026",
+    "createdAt": "2026-08-19",
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": "10-15 working days",
+    "confirmedFunctions": [
+      "Customer-facing product catalog for ~100-200 products, categories, search/filter, product detail",
+      "Multi-product selection/order list with quantity, unit price, subtotal",
+      "Order Inquiry via Telegram and Facebook Messenger",
+      "Simple Admin Dashboard: product list, Add/Edit/Delete product, categories, price, images, stock/status"
+    ],
+    "sourceFiles": [
+      "C042 - Mr. Thearith Ret E-Commerce Website__BizWeb_KH_Quotation_C042_Mr_Thearith_Ret_Year_By_Year_Final.txt"
+    ],
+    "notes": "Year-by-Year quotation format, Year 1 total $500; Demo Preview TBC, client signature blank; no payment evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C043",
+    "clientName": "Ms. Kanharoth Heang",
+    "businessName": "E-Commerce / Online Retail (To Be Confirmed)",
+    "industry": "Retail / E-Commerce",
+    "projectType": "E-Commerce Level 1",
+    "projectTypeRaw": "E-Commerce Website + CMS/Admin Dashboard + Online Payment",
+    "quotedValue": 899.0,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C043-8990-20260821",
+    "quotationDateRaw": "21 Aug 2026",
+    "createdAt": "2026-08-21",
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": "10-15 working days",
+    "confirmedFunctions": [
+      "Customer-facing product catalog for ~100-200 products, categories, search/filter, product detail",
+      "Shopping cart and checkout with quantity, unit price, subtotal",
+      "Online Payment integration with one supported payment/KHQR provider",
+      "CMS/Admin Dashboard: admin login, Add/Edit/Delete products/categories, price, images, stock/status"
+    ],
+    "sourceFiles": [
+      "C043 - Ms. Kanharoth Heang E-Commerce__BizWeb_KH_Quotation_C043_Ms_Kanharoth_Heang_Option_2_CMS_Payment_FINAL.txt"
+    ],
+    "notes": "Filename marked FINAL but Demo Preview TBC, client signature blank; no payment evidence. Year 1 total $899.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  },
+  {
+    "code": "C044",
+    "clientName": "Mr. អូច និមល",
+    "businessName": "Educational Content & Learning Materials",
+    "industry": "School / Education",
+    "projectType": "Starter Website",
+    "projectTypeRaw": "One-Page Static Website (Starter Package) - Educational Content",
+    "quotedValue": 110.28,
+    "confirmedValue": null,
+    "leadStatus": "Quotation Sent",
+    "evidenceStrength": "Low",
+    "needsManualReview": true,
+    "historicalListConflict": false,
+    "quotationNumber": "BW-Q-C044-EDU-20260822",
+    "quotationDateRaw": "22 August 2026",
+    "createdAt": "2026-08-22",
+    "invoiceNumber": null,
+    "domain": null,
+    "expectedDelivery": "3-5 working days",
+    "confirmedFunctions": [
+      "One-Page Static Website: Home, Books, Study Materials, Learning Videos, How to Buy, About, Contact",
+      "Buy/Order buttons linking to client Telegram chat",
+      "English default + Khmer language switch",
+      "Mobile Responsive, Basic SEO, 2 Revision Rounds"
+    ],
+    "sourceFiles": [
+      "C044__quotation.txt"
+    ],
+    "notes": "Client name only given in Khmer script in source; domain name itself TBC by client; signature blank; no payment evidence.",
+    "amountCollected": null,
+    "remainingBalance": null,
+    "paymentStatus": "Payment Data Unconfirmed",
+    "projectStage": null
+  }
+];
+
+function buildRealClientData(){
+  const leads = [];
+  const projects = [];
+  const payments = [];
+  const activities = [];
+  const followups = []; // intentionally empty — no documented next-follow-up dates exist in any source record (spec §19)
+  const importedAt = new Date().toISOString();
+
+  REAL_CLIENTS.forEach(c=>{
+    const leadId = 'L' + c.code.slice(1);
+    const isConfirmed = c.leadStatus === 'Confirmed';
+    const industry = (c.industry && c.industry !== 'Unspecified') ? c.industry : null;
+    const createdAtIso = c.createdAt ? (c.createdAt + 'T09:00:00.000Z') : null;
+    const refLabel = `${c.clientName} — ${c.businessName}`;
+
+    const reviewNoteParts = [];
+    if(c.notes) reviewNoteParts.push(c.notes);
+    if(c.expectedDelivery) reviewNoteParts.push(`Expected delivery (per quotation): ${c.expectedDelivery}.`);
+    if(c.domain) reviewNoteParts.push(`Domain: ${c.domain}.`);
+    if(c.invoiceNumber) reviewNoteParts.push(`Invoice: ${c.invoiceNumber}.`);
+    if(c.historicalListConflict) reviewNoteParts.push('NOTE: This client is on the previously-supplied "historically closed" list, but the reviewed folder evidence does NOT show a paid deposit/invoice — kept as Open/Potential per actual document evidence. Needs Manual Review.');
+    else if(c.needsManualReview) reviewNoteParts.push('Needs Manual Review — evidence strength: ' + c.evidenceStrength + '.');
+    reviewNoteParts.push(`Source: ${(c.sourceFiles||[]).join('; ') || 'folder review, no evidentiary document found'}.`);
+
+    const lead = {
+      id: leadId,
+      clientName: c.clientName, businessName: c.businessName, phone: '', telegram: '', facebook: '',
+      industry,
+      interestedService: c.projectType,
+      estimatedValue: c.quotedValue,
+      leadSource: 'Unspecified',
+      assignedSales: 'Unassigned',
+      status: c.leadStatus,
+      nextFollowup: null,
+      lastContact: null,
+      expectedCloseDate: null,
+      quotationStatus: c.quotationNumber ? 'Sent' : 'Not Sent',
+      quotationAmount: c.quotedValue,
+      quotationRef: c.quotationNumber || '',
+      demoLink: '',
+      notes: reviewNoteParts.join(' '),
+      lostReason: null,
+      projectCode: isConfirmed ? c.code : null,
+      createdAt: createdAtIso,
+      updatedAt: createdAtIso,
+      // ---- data-source traceability (spec §23) — not shown prominently in UI ----
+      sourceFiles: c.sourceFiles || [],
+      sourceType: 'Imported Client Record',
+      sourceDate: c.quotationDateRaw || null,
+      confidence: c.evidenceStrength,
+      needsManualReview: !!c.needsManualReview,
+      historicalListConflict: !!c.historicalListConflict,
+      // ---- archive / soft-delete state (Session 6) ----
+      archived: false, archivedAt: null, archivedBy: null, archiveReason: null,
+    };
+    leads.push(lead);
+
+    activities.push({
+      id: 'A' + leadId + '-import', at: importedAt, userName: 'System Import', refType:'lead', refId: leadId, refLabel,
+      type: 'Data Imported', description: `Imported existing client record into CRM from BizWeb KH client folder ${c.code} (confidence: ${c.evidenceStrength}).`,
+      fromValue: null, toValue: null, remark: null
+    });
+
+    if(isConfirmed){
+      const proj = {
+        id: c.code, leadId, clientName: c.clientName, businessName: c.businessName, phone: '', industry,
+        projectType: c.projectType, estimatedValue: c.quotedValue, confirmedValue: c.confirmedValue,
+        depositPct: null, // actual deposit % not separately documented — never assumed
+        assignedSales: 'Unassigned', stage: c.projectStage || 'Confirmed',
+        startDate: c.createdAt, expectedDelivery: null,
+        leadSource: 'Unspecified', demoLink: '', quotationRef: c.quotationNumber || '',
+        notes: reviewNoteParts.join(' '),
+        functions: (c.confirmedFunctions && c.confirmedFunctions.length) ? [{
+          id: fnId(), module: c.projectTypeRaw || c.projectType,
+          functions: c.confirmedFunctions.map(n=>({ id: fnId(), name: n, status: 'Confirmed' }))
+        }] : [],
+        createdAt: createdAtIso,
+      };
+      projects.push(proj);
+
+      activities.push({
+        id: 'A' + c.code + '-import', at: importedAt, userName: 'System Import', refType:'project', refId: c.code, refLabel: `${c.code} — ${c.businessName}`,
+        type: 'Data Imported', description: `Imported existing confirmed project ${c.code} into CRM from BizWeb KH client folder (confidence: ${c.evidenceStrength}).`,
+        fromValue: null, toValue: null, remark: null
+      });
+
+      if(c.amountCollected != null && c.amountCollected > 0){
+        payments.push({
+          id: 'PM' + c.code + '-import', projectId: c.code, amount: c.amountCollected,
+          date: c.createdAt, method: 'Other', type: (c.remainingBalance > 0 ? 'Deposit' : 'Final Payment'),
+          note: 'Imported from invoice/deposit evidence in client folder — exact payment date/method not separately documented.',
+          recordedBy: 'System Import', createdAt: importedAt
+        });
+        activities.push({
+          id: 'A' + c.code + '-paymport', at: importedAt, userName: 'System Import', refType:'project', refId: c.code, refLabel: `${c.code} — ${c.businessName}`,
+          type: 'Payment Recorded', description: `Imported payment record: $${c.amountCollected} for project ${c.code} (from invoice evidence).`,
+          fromValue: null, toValue: null, remark: null
+        });
+      }
+    }
+  });
+
+  return { leads, activities, followups, projects, payments };
+}
+
+/* ---------------------------------------------------------------------- */
+/* Demo data seeding                                                      */
+/* ---------------------------------------------------------------------- */
+
+// PRODUCTION CUTOVER (localStorage -> Supabase): DEMO_USERS (the fake
+// Sokha Vann / Samphors Chan / Dara Meas accounts) has been deleted. The
+// Users module now lists only the real Supabase `profiles` rows — see
+// DB.init() above (rowToUser()). buildRealClientData()/REAL_CLIENTS above
+// are no longer used to seed anything (that data already lives in
+// Supabase, having been migrated there) — they're left in place only as a
+// historical record of the original client-data import/evidence review,
+// never invoked automatically.
+//
+// fnId() is still genuinely used elsewhere (SERVICE_PRICE_LIST above,
+// projects.js, quotations.js) so it's preserved here.
+function fnId(){ return 'FN' + Math.random().toString(36).slice(2,9); }
+
+// seedDatabase()/DB.reset() intentionally no longer fabricate or reseed
+// any data — see DB.reset() (re-fetches from Supabase) above. This
+// function is kept only so nothing else that might still reference it
+// throws; it is never called automatically.
+function seedDatabase(){ console.warn('seedDatabase() is a no-op in production — data now lives in Supabase. Use DB.init()/DB.reset().'); }
+
+// NOTE: DB.init() (async) must be awaited by the page's bootstrap script
+// before any UI module runs — see dashboard/index.html. It is NOT called
+// here at load time (unlike the old `seedDatabase(false)` call this
+// replaces) because it needs a live Supabase session/network round trip.
+
+/* ---------------------------------------------------------------------- */
+/* Save helpers (Neon build) — every save handler uses these so a button   */
+/* cannot be double-clicked while a save is on the wire, and a failure is  */
+/* always shown to the user.                                               */
+/* ---------------------------------------------------------------------- */
+// Runs fn() once at a time per button; the button is disabled meanwhile. Returns fn's result, or undefined if a save was already running.
+async function runSave(btn, fn){
+  if(btn && btn.dataset.busy === '1') return undefined;
+  const label = btn ? btn.textContent : null;
+  if(btn){ btn.dataset.busy = '1'; btn.disabled = true; btn.setAttribute('aria-busy','true'); }
+  try{ return await fn(); }
+  finally{ if(btn){ btn.dataset.busy = ''; btn.disabled = false; btn.removeAttribute('aria-busy'); if(label !== null && btn.textContent !== label) btn.textContent = label; } }
+}
+// Shows why a save failed (server message translated for staff, never SQL) and returns false so callers can `return saveFailed(r)`.
+function saveFailed(r, fallback){
+  console.error('Save failed', r && r.error);
+  try{ toast((r && r.userMessage) || fallback || 'Could not save. Your changes were not stored. Please try again.', 'error'); }catch(e){ alert((r && r.userMessage) || fallback || 'Could not save.'); }
+  return false;
+}
+
+// Follow-up history note (lead_activities): the business change was already confirmed, so a failure here is reported but does not undo it.
+async function recordLeadActivity(rec){
+  const r = await DB.appendLeadActivity(rec);
+  if(!r.ok){ console.error('Follow-up history note was not saved', r.error); try{ toast('The change was saved, but its follow-up history note could not be stored: ' + r.userMessage, 'error'); }catch(e){} }
+  return r;
+}
+
+// Browser-side business-number generation is RETIRED: quotation, invoice and receipt numbers, lead ids and (unless a person enters one) project codes
+// are allocated by the server inside the same transaction that saves the record. Any leftover caller fails loudly instead of inventing a number.
+generateQuoteNumber = generateInvoiceNumber = generateReceiptNumber = function(){ throw new Error('Business numbers are assigned by the server when a record is saved; the browser must not generate them.'); };
