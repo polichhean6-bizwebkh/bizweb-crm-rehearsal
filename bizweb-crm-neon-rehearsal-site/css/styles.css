@@ -1,0 +1,1256 @@
+/* ==========================================================================
+   BizWeb KH — Internal CRM
+   Design system: reuses BizWeb KH brand tokens (navy / blue / cyan / orange)
+   ========================================================================== */
+
+/* ---------- Theme tokens ---------- */
+/* Brand colors (--navy/--blue/--cyan/--orange/--green/--red/--amber/
+   --purple and their *-soft pill variants) are UNCHANGED between themes —
+   they're BizWeb KH's actual brand palette, and status-badge pills already
+   carry their own opaque background+text pair, so they stay readable
+   sitting on either a light or dark page without any changes (spec: keep
+   existing blue branding; preserve status-color meanings).
+
+   What DOES need to flip between themes are the generic UI-surface tokens
+   below: --soft (page bg), --surface (cards/panels/modals/inputs by
+   default), --surface-2 (table headers, subtle alt panels), --line
+   (borders), --muted (secondary text), --text (primary text), --input-bg,
+   --gray-soft (subtle hover/pill backgrounds). --line, --muted and
+   --gray-soft were ALREADY used via var() everywhere borders/secondary
+   text/subtle fills appear in this file, so overriding just those three
+   tokens under [data-theme="dark"] retroactively themes dozens of rules
+   with no per-rule edits needed. */
+:root{
+  --navy:#071c3d;
+  --ink:#12284d;
+  --blue:#1d7bff;
+  --blue-dark:#155fcc;
+  --cyan:#18c8ff;
+  --orange:#ff8a3d;
+  --soft:#f5f9ff;
+  --line:#dce8f7;
+  --muted:#526584;
+  --white:#fff;
+  --shadow:0 12px 32px rgba(21,62,121,.10);
+  --shadow-lg:0 18px 50px rgba(21,62,121,.14);
+  --radius:14px;
+  --radius-sm:9px;
+
+  --sidebar-w:236px;
+  --topbar-h:60px;
+
+  --green:#12a775;
+  --green-soft:#e7f8f1;
+  --red:#e0473c;
+  --red-soft:#fdeceb;
+  --amber:#d98a12;
+  --amber-soft:#fef4e2;
+  --purple:#7c5cff;
+  --purple-soft:#f1edff;
+  --gray-soft:#eef2f7;
+
+  --surface:#fff;
+  --surface-2:#f7faff;
+  --surface-hover:#f9fbff;
+  --input-bg:#fff;
+  --text:var(--navy);
+  --scrollbar-thumb:#c6d7ee;
+}
+
+/* Professional dark navy theme (not a color inversion) — page background
+   #0F172A, card/panel surfaces #1E293B, a slightly deeper #111827 for
+   table headers and other subtle alt panels, primary text #F8FAFC,
+   secondary text #94A3B8, per the requested visual direction. Applied via
+   [data-theme="dark"] on <html>, toggled by theme.js and persisted to
+   localStorage — see js/theme.js for the toggle + early-apply logic. */
+[data-theme="dark"]{
+  --soft:#0F172A;
+  --surface:#1E293B;
+  --surface-2:#111827;
+  --surface-hover:#243449;
+  --line:#2b3b52;
+  --muted:#94A3B8;
+  --text:#F8FAFC;
+  --input-bg:#16233a;
+  --gray-soft:#223349;
+  --scrollbar-thumb:#3a4a63;
+  --shadow:0 12px 32px rgba(0,0,0,.35);
+  --shadow-lg:0 18px 50px rgba(0,0,0,.45);
+}
+
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;
+  background:var(--soft);
+  color:var(--text);
+  font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+  line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+  transition:background .15s ease,color .15s ease;
+}
+a{color:inherit;text-decoration:none}
+button{font:inherit}
+ul{margin:0;padding:0;list-style:none}
+h1,h2,h3,h4{margin:0}
+input,select,textarea{font:inherit;color:inherit}
+img{max-width:100%;display:block}
+
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:var(--scrollbar-thumb);border-radius:99px}
+::-webkit-scrollbar-track{background:transparent}
+
+.scroll-x{overflow-x:auto}
+
+/* ---------- Buttons ---------- */
+.btn{
+  border:0;border-radius:9px;display:inline-flex;align-items:center;justify-content:center;
+  gap:7px;min-height:38px;padding:9px 15px;font-weight:700;font-size:13.5px;cursor:pointer;
+  transition:.15s;white-space:nowrap;
+}
+.btn svg{width:15px;height:15px}
+.btn-primary{color:#fff;background:linear-gradient(135deg,var(--blue),var(--blue-dark));box-shadow:0 8px 18px rgba(29,123,255,.25)}
+.btn-primary:hover{transform:translateY(-1px);box-shadow:0 12px 22px rgba(29,123,255,.32)}
+.btn-secondary{color:var(--text);background:var(--surface);border:1px solid var(--line)}
+.btn-secondary:hover{border-color:var(--blue);color:var(--blue)}
+.btn-outline{color:var(--blue);border:1px solid #b9d5fb;background:var(--surface)}
+.btn-outline:hover{background:#eef6ff}
+.btn-danger{color:#fff;background:var(--red)}
+.btn-danger:hover{filter:brightness(1.06)}
+.btn-ghost{background:transparent;color:var(--muted)}
+.btn-ghost:hover{background:var(--gray-soft);color:var(--text)}
+.btn-sm{min-height:31px;padding:6px 11px;font-size:12.5px;border-radius:7px}
+.btn-block{width:100%}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
+.icon-btn{width:32px;height:32px;border-radius:8px;border:1px solid var(--line);background:var(--surface);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;color:var(--muted)}
+.icon-btn:hover{border-color:var(--blue);color:var(--blue)}
+.icon-btn svg{width:15px;height:15px}
+
+/* ---------- App Shell ---------- */
+.app-shell{display:flex;min-height:100vh}
+
+.sidebar{
+  width:var(--sidebar-w);flex:0 0 var(--sidebar-w);
+  background:linear-gradient(180deg,var(--navy),#0a2246);
+  color:#dce8fb;display:flex;flex-direction:column;
+  position:fixed;top:0;left:0;bottom:0;z-index:40;
+  transition:transform .2s ease;
+}
+/* Official BizWeb KH branding (spec: standardize on bizweb-kh-logo-main/
+   -white.svg from the centralized assets/branding/ folder — see also
+   .login-logo and .quote-doc-brand below). The sidebar's own background is
+   a fixed dark navy gradient regardless of the app's light/dark theme
+   toggle (it's a brand element, not a themed surface). The full-color
+   logo (bizweb-kh-logo-main.svg) doesn't have enough contrast on its own
+   against that navy, so it sits on a small white badge (.brand-logo-badge)
+   instead of switching to the white logo variant. The logo SVG already
+   contains the "BizWeb KH" wordmark, so no separate brand-name text is
+   duplicated beside it — only the "Internal CRM" supporting caption
+   remains, stacked below per the recommended layout. */
+.sidebar-brand{display:flex;flex-direction:column;align-items:flex-start;gap:10px;padding:18px 18px 16px;border-bottom:1px solid rgba(255,255,255,.08)}
+.sidebar-brand .brand-logo-badge{display:inline-flex;align-items:center;justify-content:center;background:#fff;border-radius:var(--radius-sm);padding:10px 16px;box-shadow:0 1px 2px rgba(8,20,45,.12)}
+.sidebar-brand .brand-logo{display:block;width:138px;max-width:100%;height:auto}
+.sidebar-brand .brand-caption{font-size:10.5px;color:#8fa6c9;font-weight:600;letter-spacing:.4px;text-transform:uppercase}
+
+.sidebar-nav{flex:1;padding:14px 10px;overflow-y:auto}
+.sidebar-nav .nav-item{
+  display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:9px;
+  color:#b7c8e6;font-size:13.5px;font-weight:600;cursor:pointer;margin-bottom:2px;
+}
+.sidebar-nav .nav-item svg{width:17px;height:17px;flex:0 0 17px;stroke:currentColor;fill:none;stroke-width:1.8}
+.sidebar-nav .nav-item:hover{background:rgba(255,255,255,.06);color:#fff}
+.sidebar-nav .nav-item.active{background:rgba(29,123,255,.22);color:#fff;box-shadow:inset 3px 0 0 var(--blue)}
+.sidebar-nav .nav-section{font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;color:#5f7699;font-weight:800;padding:14px 12px 6px}
+
+.sidebar-foot{padding:14px 16px;border-top:1px solid rgba(255,255,255,.08)}
+.sidebar-user{display:flex;align-items:center;gap:10px}
+.sidebar-user .avatar{width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,var(--cyan),var(--blue));display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:13px;flex:0 0 34px}
+.sidebar-user .who strong{display:block;font-size:13px;color:#fff}
+.sidebar-user .who span{display:block;font-size:11px;color:#8fa6c9}
+.sidebar-foot .logout-link{display:flex;align-items:center;gap:6px;margin-top:10px;font-size:12px;color:#8fa6c9;cursor:pointer}
+.sidebar-foot .logout-link:hover{color:#fff}
+.sidebar-foot .logout-link svg{width:13px;height:13px}
+
+.main-col{flex:1;margin-left:var(--sidebar-w);display:flex;flex-direction:column;min-width:0}
+
+.topbar{
+  height:var(--topbar-h);flex:0 0 var(--topbar-h);display:flex;align-items:center;gap:14px;
+  padding:0 22px;background:var(--surface);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:30;
+}
+.topbar .page-title{font-size:17px;font-weight:800;color:var(--text)}
+.topbar .page-sub{font-size:12px;color:var(--muted);margin-top:1px}
+.topbar-spacer{flex:1}
+.menu-toggle-btn{display:none;background:none;border:0;color:var(--text);cursor:pointer;padding:6px}
+.menu-toggle-btn svg{width:22px;height:22px}
+/* .lang-toggle (EN/Khmer switch) removed along with its markup — the CRM
+   is English-only now (spec §3/§4). */
+/* ---------- Theme toggle (spec §2) ---------- */
+.theme-toggle-btn{
+  background:none;border:1px solid var(--line);border-radius:8px;
+  width:34px;height:34px;display:flex;align-items:center;justify-content:center;
+  color:var(--muted);cursor:pointer;flex:0 0 34px;
+}
+.theme-toggle-btn:hover{border-color:var(--blue);color:var(--blue)}
+.theme-toggle-btn svg{width:17px;height:17px}
+
+.content{padding:22px;flex:1}
+
+/* ---------- Cards / KPIs ---------- */
+/* Grouped KPI rows (Dashboard — spec §1): each business group (Sales
+   Pipeline / Project Delivery / Financial Performance) gets a small label
+   and its own grid, so related cards visually sit together instead of one
+   undifferentiated wall of cards. */
+.kpi-group{margin-bottom:20px}
+.kpi-group:last-child{margin-bottom:0}
+.kpi-group-title{font-size:11px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:0 0 10px}
+.kpi-group .kpi-grid{margin-bottom:0}
+.kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px}
+.kpi-grid-2{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;max-width:calc(50% - 7px)}
+.kpi-card{
+  background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;
+  box-shadow:0 4px 14px rgba(21,62,121,.05);
+}
+.kpi-card .kpi-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.kpi-card .kpi-icon{width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center}
+.kpi-card .kpi-icon svg{width:17px;height:17px}
+.kpi-card .kpi-value{font-size:24px;font-weight:850;color:var(--text);line-height:1}
+.kpi-card .kpi-label{font-size:12px;color:var(--muted);margin-top:6px;font-weight:600}
+.kpi-card .kpi-trend{font-size:11px;font-weight:700;margin-top:8px}
+/* Sales Pipeline Value cards (dashboard metric-clarity task): a small
+   "N opportunities" count line between the dollar value and the label, and
+   a small subtitle line under the label reinforcing the current-stage-only
+   framing (e.g. "Currently at this stage"). Both intentionally lighter/
+   smaller than .kpi-label so the visual hierarchy stays value > label >
+   helper text. */
+.kpi-card .kpi-count{font-size:11px;color:var(--muted);margin-top:3px;font-weight:600}
+.kpi-card .kpi-sub{font-size:10.5px;color:var(--muted);margin-top:2px;font-weight:500;opacity:.85}
+/* "Total Open Pipeline" headline card — visually a little stronger than its
+   peer stage cards (slightly larger value + a colored left border + a very
+   faint tint of the same accent) since it's the section's grand total, not
+   a same-weight sibling. Deliberately subtle (no separate box/heavier
+   shadow) so it doesn't read as an amount stacked ON TOP of the others —
+   the section tooltip/subtitles already carry that "sums to this total"
+   framing. */
+.kpi-card-strong{border-left:3px solid var(--kpi-accent, var(--blue))}
+.kpi-card-strong .kpi-value{font-size:27px}
+
+/* KPI card help icon + tooltip (Lead Records summary cards). The "?" is a
+   real focusable <button>, not decorative — it works on hover, click/tap,
+   and keyboard focus (see wireKpiHelpTooltips in leads.js). The tooltip
+   itself is a single shared element appended to <body> and positioned via
+   JS with getBoundingClientRect(), rather than nested inside the card, so
+   it can never be clipped by the card/panel and is always clamped to stay
+   inside the viewport. Background is intentionally INVERTED from the
+   normal --surface tokens (dark in light mode, light in dark mode) so it
+   reads as a distinct floating overlay rather than blending into the card
+   underneath it. */
+.kpi-help-btn{
+  appearance:none;-webkit-appearance:none;background:transparent;padding:0;margin-left:4px;
+  width:14px;height:14px;line-height:12px;font-size:10px;font-weight:800;font-family:inherit;
+  border:1px solid var(--muted);border-radius:50%;color:var(--muted);
+  display:inline-flex;align-items:center;justify-content:center;vertical-align:middle;cursor:pointer;
+}
+.kpi-help-btn:hover, .kpi-help-btn:focus-visible{color:#fff;background:var(--blue);border-color:var(--blue)}
+.kpi-help-btn:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+.kpi-help-tooltip{
+  position:fixed;z-index:250;max-width:260px;padding:8px 11px;border-radius:8px;
+  font-size:12px;line-height:1.45;font-weight:500;letter-spacing:0;
+  background:var(--navy);color:#fff;box-shadow:0 10px 26px rgba(7,20,45,.28);
+  opacity:0;transform:translateY(2px);pointer-events:none;
+  transition:opacity .12s ease,transform .12s ease;
+}
+.kpi-help-tooltip.is-visible{opacity:1;transform:translateY(0)}
+[data-theme="dark"] .kpi-help-tooltip{background:#F1F5F9;color:var(--navy);box-shadow:0 10px 26px rgba(0,0,0,.45)}
+
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:0 4px 14px rgba(21,62,121,.05)}
+.panel-head{display:flex;align-items:center;justify-content:space-between;padding:15px 18px;border-bottom:1px solid var(--line)}
+.panel-head h3{font-size:14.5px;font-weight:800}
+.panel-head .see-all{font-size:12px;font-weight:700;color:var(--blue);cursor:pointer}
+.panel-body{padding:6px 0}
+.panel-body.pad{padding:16px 18px}
+
+.dash-grid{display:grid;grid-template-columns:1.3fr 1fr;gap:16px}
+.dash-grid .stack{display:flex;flex-direction:column;gap:16px}
+
+/* ---------- Settings -> Quotations: Important Notes accordion/card ---------- */
+/* One card per note (Domain & Hosting Support, Annual Renewal, ...) inside
+   the Website/System Template tabs — clearer than a bare stacked list of
+   labeled textareas, and explicitly theme-aware (var(--surface-2)/var(--line))
+   so dark mode never shows a white card with invisible text. */
+.qs-note-card{background:var(--surface-2);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:10px}
+.qs-note-card:last-child{margin-bottom:0}
+.qs-note-card h4{font-size:13px;font-weight:800;color:var(--text);margin:0 0 8px}
+/* These textareas sit directly inside .panel-body/.qs-note-card rather
+   than a .form-field wrapper, so they need their own explicit
+   border/background/text-color — otherwise they'd fall back to the
+   browser's default textarea styling, which in dark mode renders as a
+   white box with barely-visible text (exactly the "no white input fields
+   with invisible text" failure the spec calls out). */
+.qs-note-card textarea, #qsSubtabBody > .panel textarea{
+  width:100%;min-height:64px;resize:vertical;
+  border:1px solid var(--line);border-radius:9px;padding:9px 11px;font-size:13.5px;
+  background:var(--input-bg);color:var(--text);
+}
+.qs-note-card textarea:focus, #qsSubtabBody > .panel textarea:focus{outline:2px solid #bcd6ff;border-color:var(--blue)}
+[data-theme="dark"] .qs-note-card textarea:focus, [data-theme="dark"] #qsSubtabBody > .panel textarea:focus{outline-color:#2a4a75}
+
+.mini-row{display:flex;align-items:center;justify-content:space-between;padding:10px 18px;border-bottom:1px solid var(--line);gap:10px}
+.mini-row:last-child{border-bottom:0}
+.mini-row .mini-main{min-width:0}
+.mini-row .mini-title{font-size:13px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mini-row .mini-sub{font-size:11.5px;color:var(--muted);margin-top:2px}
+.mini-row .mini-right{text-align:right;flex:0 0 auto;font-size:11.5px;color:var(--muted)}
+.empty-row{padding:22px 18px;text-align:center;color:var(--muted);font-size:13px}
+
+/* ---------- Add to Pipeline autocomplete dropdown ---------- */
+.atp-row{cursor:pointer;transition:background .12s ease}
+.atp-row:hover{background:var(--surface-2)}
+.atp-row.atp-disabled{cursor:default;opacity:.65}
+.atp-row.atp-disabled:hover{background:transparent}
+/* Keyboard-navigated highlight (Arrow Down/Up) — same visual treatment as
+   :hover so keyboard and mouse users see a consistent "this is what Enter
+   will pick" affordance. */
+.atp-row.atp-active{background:var(--surface-2)}
+.atp-pill{flex:0 0 auto;font-size:10.5px;font-weight:700;padding:4px 9px;border-radius:20px;white-space:nowrap}
+.atp-pill-select{background:rgba(18,167,117,.16);color:#12a775}
+.atp-pill-pipeline{background:rgba(217,138,18,.16);color:#d98a12}
+.atp-pill-notqualified{background:rgba(82,101,132,.18);color:var(--muted)}
+
+/* ---------- Tables ---------- */
+.table-wrap{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;box-shadow:0 4px 14px rgba(21,62,121,.05)}
+/* `.table-wrap`'s own `overflow:hidden` (for rounded corners on the big
+   list tables) was silently overriding `.scroll-x`'s `overflow-x:auto`
+   whenever both classes were combined (`class="table-wrap scroll-x"`,
+   used by every table.data-table nested inside a modal) — same-specificity
+   rules cascade by source order, and .table-wrap happens to be declared
+   after .scroll-x. Net effect: a data-table with its baked-in 1100px
+   min-width (below), rendered inside a much narrower panel like the
+   Create/Edit Quotation form column, had nowhere to go but get hard-
+   clipped at the container edge instead of scrolling — exactly the
+   "30/30/40 payment schedule % column partially hidden" bug. This
+   two-class selector outranks the single-class `.table-wrap` rule above on
+   specificity (not source order), so scrolling is restored wherever both
+   classes are actually used together, with zero effect on `.table-wrap`
+   used alone. */
+.table-wrap.scroll-x{overflow-x:auto;overflow-y:visible}
+table.data-table{width:100%;border-collapse:collapse;font-size:13px;min-width:1100px}
+/* Small, few-column tables embedded inside a narrow panel (Create/Edit
+   Quotation's Scope-of-Work editor and Payment Schedule tables) — the
+   1100px min-width above is sized for the big list-page tables (Leads,
+   Quotations, …) that need horizontal scroll room on narrow screens; it
+   has no reason to apply to a 3-column mini-table that already fits its
+   container. Combined with the overflow fix above, this is what actually
+   keeps every column (including %) fully visible with no clipping and no
+   horizontal scrollbar at normal laptop widths. */
+table.data-table.qc-mini-table{min-width:0}
+/* Payment History (Project View > Payment History) renders inside the
+   .modal-lg panel (max-width:820px, ~776px usable after padding) — the
+   shared 1100px min-width above (tuned for full-width page tables like
+   Projects/Leads) forced ~300-450px of this 7-column table off-screen to
+   the right, which is exactly where Reference and Action/Edit live. That
+   silently hid Edit behind an easy-to-miss horizontal scroll inside a
+   small modal section — not a caching, role, or data issue. Fixing the
+   floor to something these 7 narrow columns actually need keeps it fully
+   visible without scrolling on any normal window width, while .scroll-x
+   above still provides a fallback on genuinely narrow (phone) screens. */
+table.data-table.payment-history-table{min-width:0}
+/* Belt-and-suspenders for the very narrow (phone) fallback where .scroll-x
+   still kicks in: pin the Action column so Edit/Void stay reachable
+   without hunting through a horizontal scroll. Explicit (not `inherit`)
+   background — a td's own background is transparent by default, and
+   `inherit` would pull it from <tr>, which has none, letting scrolled
+   content show through the sticky cell. */
+table.data-table.payment-history-table th:last-child,
+table.data-table.payment-history-table td:last-child{
+  position:sticky;right:0;background:var(--surface);
+}
+table.data-table.payment-history-table thead th:last-child{background:var(--surface-2)}
+table.data-table.payment-history-table tbody tr:hover td:last-child{background:var(--surface-hover)}
+table.data-table th{
+  text-align:left;padding:11px 14px;background:var(--surface-2);color:var(--muted);font-size:11px;
+  text-transform:uppercase;letter-spacing:.4px;font-weight:800;border-bottom:1px solid var(--line);white-space:nowrap;
+}
+table.data-table td{padding:11px 14px;border-bottom:1px solid var(--line);vertical-align:middle}
+table.data-table tbody tr:hover{background:var(--surface-hover)}
+table.data-table tbody tr:last-child td{border-bottom:0}
+.cell-strong{font-weight:700;color:var(--text)}
+.cell-sub{font-size:11.5px;color:var(--muted);margin-top:2px}
+.cell-nowrap{white-space:nowrap}
+/* Lead Records > Lead Date header (spec §6: optional sortable column) */
+.th-sortable{cursor:pointer;user-select:none}
+.th-sortable:hover{color:var(--text)}
+.sort-indicator{font-size:10px}
+.cell-link{color:var(--blue);font-weight:700;cursor:pointer}
+.cell-link:hover{text-decoration:underline}
+
+/* ---------- Search box (standalone rules — NOT scoped to .filters-bar,   */
+/* so it renders correctly wherever it's used: filter bars, modals, etc.   */
+/* This scoping gap was the root cause of the oversized search-icon bug.)  */
+/*                                                                          */
+/* .search-box input uses the [type="text"] attribute selector purely to   */
+/* WIN the specificity tie against .form-field input (styles.css "Forms"   */
+/* section, same (0,1,1) specificity) whenever a search box is nested      */
+/* inside a .form-field — e.g. Pipeline's "Add to Pipeline → Select Lead"  */
+/* modal. Without it, .form-field input's plain padding:9px 11px (later in */
+/* this file) won by source order alone, collapsing the left padding this  */
+/* rule sets and letting typed text render underneath the search icon.     */
+/* Every .search-box input in the app is already type="text", so this      */
+/* changes nothing about which inputs match — only which rule wins.        */
+/* ---------- */
+.search-box{position:relative;flex:1;min-width:220px}
+.search-box input[type="text"]{width:100%;padding:9px 14px 9px 40px;border:1px solid var(--line);border-radius:9px;background:var(--input-bg);font-size:13px;box-sizing:border-box}
+.search-box svg{position:absolute;left:13px;top:50%;transform:translateY(-50%);width:15px!important;height:15px!important;min-width:0;color:var(--muted);pointer-events:none}
+
+/* ---------- Filters bar ---------- */
+.filters-bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px}
+/* .sel is also used OUTSIDE .filters-bar (Service Price List table inputs,
+   the Project View module function-status dropdown, etc.) — matching it
+   unscoped as well (not just ".filters-bar .sel") means every .sel-tagged
+   field gets the same dark-input styling wherever it's dropped, instead of
+   silently falling back to the browser's default white input/select.
+   min-width:120px stays scoped to .filters-bar's own selects only — the
+   narrower .sel usages elsewhere already set their own explicit width
+   inline and shouldn't be forced wider. */
+.filters-bar select, .filters-bar .sel{min-width:120px}
+.filters-bar select, .filters-bar .sel, .sel{padding:9px 10px;border:1px solid var(--line);border-radius:9px;background:var(--input-bg);font-size:12.5px;color:var(--text)}
+.filters-bar .spacer{flex:1}
+
+/* Pipeline search box clear (×) button — additively-scoped rules only
+   (search-box-clear / pipeline-search-box), so no other page's existing
+   .search-box (Leads, Add to Pipeline modal, Pipeline Archive modal) is
+   affected: none of them render this button in their markup, so these
+   rules simply never match there. */
+.search-box .search-box-clear{position:absolute;right:8px;top:50%;transform:translateY(-50%);width:22px;height:22px;display:flex;align-items:center;justify-content:center;border:none;background:transparent;color:var(--muted);cursor:pointer;font-size:16px;line-height:1;border-radius:6px;padding:0}
+/* An author stylesheet rule always wins over the UA default [hidden]{display:none},
+   regardless of specificity — so the plain display:flex above would otherwise show
+   this button even while it carries the `hidden` attribute. This explicit
+   [hidden] override (higher specificity + later in source) restores that default. */
+.search-box .search-box-clear[hidden]{display:none}
+.search-box .search-box-clear:hover{color:var(--text);background:var(--surface-2)}
+.search-box.pipeline-search-box input[type="text"]{padding-right:30px}
+
+/* Global safety net: an <svg> icon dropped anywhere with no more specific
+   rule (a new page, a new modal) still gets a sane default instead of
+   falling back to the browser's unstyled intrinsic SVG size. */
+svg{width:18px;height:18px}
+
+/* ---------- Badges ---------- */
+.badge{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border-radius:999px;font-size:11px;font-weight:800;white-space:nowrap}
+.badge-dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+
+/* status color map (class per status slug) */
+.st-new-lead{background:#eef2f7;color:#4a5b78}
+.st-contacted{background:#e6f2ff;color:#1d6fe0}
+.st-qualified{background:#e3f7ff;color:#0aa1c9}
+/* Demo Sent + Quotation Sent were merged into one stage, "Quote and Demo
+   Sent" — this replaces both old .st-demo-sent / .st-quotation-sent rules
+   (the latter had a stray invalid background value, fixed as part of this
+   consolidation) with one, reusing the old Demo Sent purple treatment. */
+.st-quote-and-demo-sent{background:var(--purple-soft);color:var(--purple)}
+/* "Follow-up" renamed to "Potential Need Follow Up" — wording only, same
+   amber treatment, same stage/position in the pipeline. */
+.st-potential-need-follow-up{background:var(--amber-soft);color:var(--amber)}
+/* On Hold / Future Follow-up (CRM feature): deliberately NOT red — red stays
+   reserved for Lost/rejected/critical. Muted purple, distinct from both the
+   amber used a few lines up for Follow-up and the brighter --purple used for
+   Quote and Demo Sent above, so three different lead stages never read as
+   "the same color" at a glance. Like every other badge here this is a
+   self-contained opaque bg+text pair, so it stays readable on both the
+   light AND dark page background without any [data-theme="dark"] override
+   needed. */
+.st-on-hold-future-follow-up{background:#efe7fb;color:#6d4aae}
+.st-negotiation{background:#ffe9e0;color:#d9540e}
+.st-confirmed{background:var(--green-soft);color:var(--green)}
+.st-deposit-paid{background:#e2f9ee;color:#0f9d63}
+.st-in-development{background:#e5edff;color:#3757d6}
+.st-final-payment-pending{background:var(--amber-soft);color:var(--amber)}
+.st-client-review{background:#eef0ff;color:#5a4fd6}
+.st-ready-to-publish{background:#e2fbf5;color:#0a9e83}
+.st-completed{background:var(--green-soft);color:var(--green)}
+.st-on-hold{background:var(--gray-soft);color:var(--muted)}
+.st-cancelled{background:var(--red-soft);color:var(--red)}
+.st-lost{background:var(--red-soft);color:var(--red)}
+.st-future-phase-2{background:var(--purple-soft);color:var(--purple)}
+
+/* quotation status / approval status */
+.st-draft{background:var(--gray-soft);color:var(--muted)}
+.st-pending-founder-review{background:var(--amber-soft);color:var(--amber)}
+.st-approved{background:var(--green-soft);color:var(--green)}
+.st-sent-to-client{background:#e6f2ff;color:#1d6fe0}
+.st-accepted{background:var(--green-soft);color:var(--green)}
+.st-rejected{background:var(--red-soft);color:var(--red)}
+.st-expired{background:var(--gray-soft);color:var(--muted)}
+.st-sales-approved{background:var(--green-soft);color:var(--green)}
+.st-founder-review-required{background:var(--amber-soft);color:var(--amber)}
+.st-founder-approved{background:var(--green-soft);color:var(--green)}
+.st-founder-rejected{background:var(--red-soft);color:var(--red)}
+
+/* Invoices module — invoice status badges (slug of the `status` field
+   directly, same statusBadge() convention as everywhere else). "Issued"
+   reuses the same blue as quotations' "Sent to Client" (both mean "live,
+   nothing settled yet"); Partially Paid / Paid reuse the palette already
+   established by the Payment Status badges just below. */
+.st-issued{background:#e6f2ff;color:#1d6fe0}
+.st-partially-paid{background:#e5edff;color:#3757d6}
+.st-paid{background:var(--green-soft);color:var(--green)}
+
+/* Settings -> Users & Roles — staff account status badges (slug of
+   `profiles.status`: invited | active | inactive). */
+.st-invited{background:var(--amber-soft);color:var(--amber)}
+.st-active{background:var(--green-soft);color:var(--green)}
+.st-inactive{background:var(--gray-soft);color:var(--muted)}
+
+.pay-not-paid{background:var(--red-soft);color:var(--red)}
+.pay-deposit-paid{background:var(--amber-soft);color:var(--amber)}
+.pay-partially-paid{background:#e5edff;color:#3757d6}
+.pay-fully-paid{background:var(--green-soft);color:var(--green)}
+
+/* ---------- Follow-up urgency chips ---------- */
+.chip-overdue{background:var(--red-soft);color:var(--red)}
+.chip-today{background:var(--amber-soft);color:var(--amber)}
+.chip-tomorrow{background:#e5edff;color:#3757d6}
+.chip-week{background:var(--gray-soft);color:var(--muted)}
+.chip-later{background:var(--gray-soft);color:var(--muted)}
+
+/* ---------- Pipeline follow-up counter chips (spec §8 — clickable) ---------- */
+.fu-counter-chip{border:1px solid transparent;border-radius:999px;padding:5px 12px;font-size:11.5px;font-weight:700;cursor:pointer;display:inline-flex;align-items:center;gap:5px}
+.fu-counter-chip b{font-weight:800}
+.fu-counter-chip.active{border-color:currentColor}
+.fu-counter-chip.chip-clear{background:var(--gray-soft);color:var(--muted);font-weight:600}
+
+/* ---------- Pipeline (Kanban) ---------- */
+.pipeline-board{display:flex;gap:12px;overflow-x:auto;padding-bottom:10px;align-items:flex-start}
+.pipeline-col{flex:0 0 250px;background:#eef3fb;border-radius:12px;padding:10px;min-height:200px}
+.pipeline-col-head{display:flex;align-items:center;justify-content:space-between;padding:4px 6px 10px}
+.pipeline-col-head .col-title{font-size:12px;font-weight:800;color:var(--text)}
+.pipeline-col-head .col-count{font-size:11px;font-weight:800;color:var(--muted);background:var(--surface);border-radius:999px;padding:1px 8px}
+.pipeline-cards{display:flex;flex-direction:column;gap:9px;min-height:60px}
+.pcard{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:11px 12px;cursor:grab;box-shadow:0 2px 6px rgba(21,62,121,.06)}
+.pcard:active{cursor:grabbing}
+.pcard.dragging{opacity:.4}
+.pcard .pcard-biz{font-size:13px;font-weight:800;color:var(--text);margin-bottom:2px}
+.pcard .pcard-client{font-size:11.5px;color:var(--muted);margin-bottom:8px}
+.pcard .pcard-svc{font-size:11px;color:var(--blue);font-weight:700;background:#eef6ff;display:inline-block;padding:2px 7px;border-radius:6px;margin-bottom:8px}
+.pcard .pcard-row{display:flex;align-items:center;justify-content:space-between;font-size:11px;color:var(--muted)}
+.pcard .pcard-value{font-weight:800;color:var(--text)}
+/* Project Code row on Quote and Demo Sent+ pipeline cards — a compact,
+   subtly-styled badge (reuses the same --gray-soft/--red-soft/--muted
+   tokens the rest of the app already themes for dark mode, so this needs
+   no separate [data-theme="dark"] override) placed right under the client
+   name per spec, never hidden when a code is missing. */
+.pcard .pcard-code-row{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:8px}
+.pcard .pcard-code{font-size:10.5px;font-weight:700;color:var(--muted);background:var(--gray-soft);padding:2px 7px;border-radius:6px;letter-spacing:.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pcard .pcard-code.pcard-code-unset{color:var(--red);background:var(--red-soft);font-weight:600;font-style:italic}
+.pcard .pcard-code-edit{border:none;background:none;cursor:pointer;color:var(--muted);padding:2px;display:inline-flex;align-items:center;border-radius:4px;flex:none}
+.pcard .pcard-code-edit:hover{color:var(--blue)}
+.pipeline-col.drag-over{background:#dfeaff}
+/* On Hold / Future Follow-up card accent (spec §2/§6) — same muted purple as
+   the status badge, applied as a left stripe rather than recoloring the
+   whole card, so the board's existing uniform column styling isn't
+   redesigned. The note/reason line reuses the same purple for its left
+   border, kept visually quiet (small, italic, muted text) since it's
+   supplementary context, not the card's headline. */
+.pcard.pcard-onhold{border-left:3px solid #6d4aae}
+.pcard-note{margin-top:6px;padding-top:6px;border-top:1px dashed var(--line);font-size:11px;font-style:italic;color:var(--muted);overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+
+/* ---------- Modal ---------- */
+.modal-overlay{position:fixed;inset:0;background:rgba(7,20,45,.5);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px}
+/* A child modal (openChildModal in app.js — e.g. Add Scope Item opened from
+   inside Create/Edit Quotation) stacks ON TOP of the parent's own overlay
+   rather than replacing it, so it needs a higher z-index than the base
+   .modal-overlay above. */
+.modal-overlay.modal-overlay-child{z-index:110}
+.modal-box{background:var(--surface);border-radius:16px;max-width:560px;width:100%;max-height:88vh;overflow-y:auto;box-shadow:0 30px 70px rgba(7,20,45,.35)}
+.modal-box.modal-lg{max-width:820px}
+/* .modal-xl — Quotations wide split-view editor only (kept separate from
+   .modal-lg, used by every other modal in the app, so nothing else is
+   affected). Unlike the default .modal-box (which just grows tall and
+   scrolls as one page), .modal-xl is a flex column with a fixed viewport
+   footprint: .modal-head/.modal-foot stay pinned, and .modal-body is the
+   single scrollable region in between — needed so the Edit/Preview split
+   inside it can give each column its own independent scrollbar (spec:
+   "form panel and preview panel should scroll independently... keep header
+   and Close button visible/sticky"). */
+.modal-box.modal-xl{
+  width:95vw;max-width:1650px;height:92vh;max-height:92vh;
+  display:flex;flex-direction:column;overflow:hidden;
+}
+.modal-box.modal-xl .modal-head,
+.modal-box.modal-xl .modal-foot{flex:0 0 auto}
+.modal-box.modal-xl .modal-body{flex:1 1 auto;min-height:0;overflow:hidden;display:flex;flex-direction:column;padding:0}
+.modal-box.modal-xl .modal-body.qc-modal-body{overflow:hidden}
+@media (max-width:1150px){
+  .modal-box.modal-xl .modal-body{overflow-y:auto;display:block}
+}
+.modal-head{display:flex;align-items:center;justify-content:space-between;padding:18px 22px;border-bottom:1px solid var(--line);gap:14px}
+.modal-head h3{font-size:16px;font-weight:800}
+.modal-head-actions{display:flex;align-items:center;gap:10px;flex:1 1 auto;justify-content:flex-end}
+.modal-close{background:none;border:0;cursor:pointer;color:var(--muted);width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+.modal-close:hover{background:var(--gray-soft);color:var(--text)}
+.modal-body{padding:20px 22px}
+.modal-foot{display:flex;justify-content:flex-end;gap:10px;padding:16px 22px;border-top:1px solid var(--line)}
+
+/* status change modal specifics */
+.status-flow{display:flex;align-items:center;gap:12px;justify-content:center;padding:16px 0 20px}
+.status-flow .arrow{color:var(--muted);font-size:20px}
+
+/* ---------- Forms ---------- */
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.form-field{display:flex;flex-direction:column;gap:5px}
+.form-field.full{grid-column:1/-1}
+.form-field label{font-size:12px;font-weight:700;color:var(--muted)}
+.form-field input,.form-field select,.form-field textarea{
+  border:1px solid var(--line);border-radius:9px;padding:9px 11px;font-size:13.5px;background:var(--input-bg);color:var(--text);width:100%;
+}
+.form-field input:focus,.form-field select:focus,.form-field textarea:focus{outline:2px solid #bcd6ff;border-color:var(--blue)}
+.form-field textarea{resize:vertical;min-height:70px}
+.form-hint{font-size:11px;color:var(--muted)}
+.form-hint b{color:var(--text);font-weight:700}
+/* Multiple stacked .form-hint lines under one field (e.g. Edit Project
+   Code's rule line + its "Last used / Suggested next" remark) — a small
+   gap keeps them from reading as one run-on sentence. */
+.form-field .form-hint + .form-hint{display:block;margin-top:3px}
+.required:after{content:" *";color:var(--red)}
+/* Read-only / auto-generated / locked field styling (Quotations spec §2/§3):
+   a field the user cannot type into must look visibly different from one
+   they can, not just behave differently — otherwise it reads as broken
+   ("why won't this field accept my input?"). Applies to native `readonly`
+   text/number/date inputs (used wherever the field's VALUE still needs to
+   stay visible/selectable/copyable — Quote No., Project Code, Year 1 Total,
+   role-locked pricing fields, lead-linked contact fields) and to `disabled`
+   selects (native <select> has no readonly, so permission/system-locked
+   dropdowns stay `disabled` but get the same muted look for consistency).
+   Muted, not faint: uses the same --muted token as every other secondary
+   text in the app, never a low-opacity fade that becomes unreadable. */
+.form-field input[readonly],
+.form-field input:disabled,
+.form-field select:disabled{
+  background:var(--surface-2);color:var(--muted);cursor:not-allowed;
+}
+.form-field input[readonly]{cursor:default}
+/* Small "Auto" pill next to a label for genuinely system-generated/
+   calculated values (Quote No., Project Code, Year 1 Total) — distinct from
+   a plain role-permission lock, which gets the muted background above but
+   no badge (it's still a real value the user typed or picked, just not
+   editable by their current role/step). */
+.field-auto-badge{
+  display:inline-block;font-size:9px;font-weight:800;letter-spacing:.3px;text-transform:uppercase;
+  color:var(--blue);background:#1d7bff1a;border-radius:4px;padding:1px 6px;margin-left:6px;vertical-align:middle;
+}
+[data-theme="dark"] .field-auto-badge{background:#1d7bff33;color:#5fa8ff}
+/* Included/Free indicator (Annual Cost Breakdown, spec §21) — a light green
+   pill next to a field/row whose amount is $0 because it's bundled/free,
+   never rendered identically to a plain "Auto" badge (blue) or a plain
+   muted/locked field, so Sales can tell at a glance WHY a cost shows $0. */
+.field-included-badge{
+  display:inline-block;font-size:9px;font-weight:800;letter-spacing:.3px;text-transform:uppercase;
+  color:#0d8a5f;background:#12a7751a;border-radius:4px;padding:1px 6px;margin-left:6px;vertical-align:middle;
+}
+[data-theme="dark"] .field-included-badge{background:#12a77533;color:#5fe0b0}
+/* To Be Confirmed indicator — neutral gray, deliberately unlike both the
+   blue "Auto" badge and the green "Included" badge so a TBC amount never
+   reads as either a calculated value or a confirmed free inclusion. */
+.field-tbc-badge{
+  display:inline-block;font-size:9px;font-weight:800;letter-spacing:.3px;text-transform:uppercase;
+  color:var(--muted);background:var(--gray-soft);border-radius:4px;padding:1px 6px;margin-left:6px;vertical-align:middle;
+}
+/* Compact toggle row attached directly under its own amount field (Annual
+   Cost Breakdown Year 1 Hosting/Maintenance "Included" toggles) — lives
+   inside the SAME .form-field as the input it governs, same width as that
+   input, so it never drifts into its own detached/wide strip. Label sits
+   left, the switch sits right. */
+.field-toggle-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:4px;font-size:11.5px;font-weight:600;color:var(--muted)}
+/* Scoped, additive-only variant of .field-toggle-row: groups the switch and
+   its label as one left-aligned control instead of spreading them across
+   the row (used for the Year 1 "Show Year 1 Maintenance Note" toggle only
+   -- 2026-09-14 layout fix). Overrides justify-content and allows the label
+   to wrap under the switch on narrow widths; everything else -- spacing,
+   font, color, and every other .field-toggle-row/.toggle-switch usage in
+   the app -- is untouched. */
+.field-toggle-row-left{justify-content:flex-start;flex-wrap:wrap}
+/* Small reusable ON/OFF toggle switch (styled checkbox, not the browser
+   default square) — used anywhere a compact included/enabled state needs
+   a slider control instead of a checkbox glyph. */
+.toggle-switch{position:relative;display:inline-block;flex:0 0 auto;width:34px;height:19px}
+.toggle-switch input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}
+.toggle-switch .toggle-slider{position:absolute;inset:0;background:var(--gray-soft);border:1px solid var(--line);border-radius:999px;transition:background .15s,border-color .15s;pointer-events:none}
+.toggle-switch .toggle-slider::before{content:"";position:absolute;left:2px;top:2px;width:13px;height:13px;background:#fff;border-radius:50%;box-shadow:0 1px 2px rgba(0,0,0,.25);transition:transform .15s}
+.toggle-switch input:checked + .toggle-slider{background:#12a775;border-color:#12a775}
+.toggle-switch input:checked + .toggle-slider::before{transform:translateX(15px)}
+.toggle-switch input:focus-visible + .toggle-slider{outline:2px solid var(--blue);outline-offset:2px}
+/* Annual Cost Breakdown year blocks (Quotations §D) — a light bordered
+   panel per year so Year 1 / Year 2 / Year 3 read as clearly separate
+   groups instead of one long flat field list. */
+.qc-year-block{border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:12px;background:var(--surface-2)}
+.qc-year-block .qc-year-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.qc-year-block .qc-year-head h4{font-size:13px;font-weight:800;color:var(--text);margin:0}
+.qc-year-total{font-size:13.5px;font-weight:800;color:var(--blue)}
+.qc-collapsible-head{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;font-size:12.5px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.4px}
+.qc-collapsible-head .car{transition:transform .15s}
+.qc-collapsible-head.open .car{transform:rotate(90deg)}
+
+/* ---------- Tabs ---------- */
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:16px}
+.tab-btn{padding:9px 14px;font-size:13px;font-weight:700;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent}
+.tab-btn.active{color:var(--blue);border-color:var(--blue)}
+
+/* ---------- Activity timeline ---------- */
+.timeline{display:flex;flex-direction:column}
+.tl-item{display:flex;gap:12px;padding:0 0 18px;position:relative}
+.tl-item:last-child{padding-bottom:0}
+.tl-item:before{content:"";position:absolute;left:5px;top:16px;bottom:0;width:1px;background:var(--line)}
+.tl-item:last-child:before{display:none}
+.tl-dot{width:11px;height:11px;border-radius:50%;background:var(--blue);flex:0 0 11px;margin-top:3px;box-shadow:0 0 0 3px #e5f0ff}
+.tl-body .tl-title{font-size:13px;font-weight:700;color:var(--text)}
+.tl-body .tl-title b{font-weight:800}
+.tl-body .tl-meta{font-size:11.5px;color:var(--muted);margin-top:2px}
+.tl-body .tl-remark{font-size:12.5px;color:var(--text);margin-top:5px;background:var(--surface-2);border-radius:8px;padding:8px 10px}
+
+/* ---------- Follow-up groups ---------- */
+.fu-group-head{display:flex;align-items:center;gap:8px;margin:20px 0 10px}
+.fu-group-head:first-child{margin-top:0}
+.fu-group-head h4{font-size:13px;font-weight:800;text-transform:uppercase;letter-spacing:.4px}
+.fu-group-head .count{font-size:11px;background:var(--gray-soft);color:var(--muted);padding:2px 8px;border-radius:999px;font-weight:800}
+
+/* ---------- Login page ---------- */
+.login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(circle at 75% 13%,rgba(255,138,61,.14),transparent 30%),radial-gradient(circle at 20% 22%,rgba(24,200,255,.16),transparent 32%),linear-gradient(135deg,#071c3d,#0d2d5d 60%,#12386f);padding:20px}
+.login-card{background:var(--surface);border-radius:20px;width:100%;max-width:400px;padding:34px 32px;box-shadow:0 30px 80px rgba(0,0,0,.35)}
+/* Official BizWeb KH branding — logo centered above the form, medium size,
+   clean spacing (spec §3). Unlike the always-dark sidebar, the login card
+   itself follows the app's light/dark theme (var(--surface)), so which
+   logo variant has enough contrast actually changes with theme: the main
+   (navy/blue) logo for light mode, the white logo for dark mode. Both
+   <img> tags are always present (so the swap needs no JS/flash-of-wrong-
+   logo risk) — CSS alone shows/hides the right one for the current
+   [data-theme]. The SVG already contains the "BizWeb KH" wordmark, so no
+   separate brand-name text is duplicated — only "Internal CRM" remains as
+   a supporting caption below it. */
+.login-logo{display:flex;flex-direction:column;align-items:center;gap:9px;margin-bottom:22px}
+.login-logo .brand-logo{display:block;width:220px;max-width:100%;height:auto}
+.login-logo .brand-logo-dark{display:none}
+:root[data-theme="dark"] .login-logo .brand-logo-light{display:none}
+:root[data-theme="dark"] .login-logo .brand-logo-dark{display:block}
+.login-logo .brand-caption{display:block;font-size:11px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.4px}
+.login-card h2{font-size:19px;margin-bottom:22px}
+.login-card .lead-sub{font-size:13px;color:var(--muted);margin-bottom:22px}
+.login-divider{display:flex;align-items:center;gap:10px;margin:16px 0;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+.login-divider:before,.login-divider:after{content:"";flex:1;height:1px;background:var(--line)}
+
+.password-field{position:relative;display:flex;align-items:center}
+.password-field input{padding-right:38px}
+.password-toggle{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:28px;height:28px;border:none;background:transparent;color:var(--muted);cursor:pointer;display:flex;align-items:center;justify-content:center;border-radius:6px}
+.password-toggle:hover{color:var(--text);background:var(--gray-soft)}
+.login-forgot{font-size:12px;font-weight:700;color:var(--blue);text-decoration:none}
+.login-forgot:hover{text-decoration:underline}
+.login-error{background:var(--red-soft);color:var(--red);font-size:12.5px;padding:9px 12px;border-radius:9px;margin-bottom:14px}
+.login-error-info{background:#eef4ff;color:var(--blue)}
+.login-error-success{background:var(--green-soft);color:var(--green)}
+.login-foot{margin-top:18px;text-align:center;font-size:11.5px;color:var(--muted);line-height:1.6}
+
+/* Generic show/hide utility — used to switch the login page between the
+   normal Sign In form and the Set New Password (Supabase recovery) form. */
+.hidden{display:none}
+
+/* ---------- Toast ---------- */
+.toast-stack{position:fixed;bottom:20px;right:20px;display:flex;flex-direction:column;gap:8px;z-index:200}
+.toast{background:var(--navy);color:#fff;padding:11px 16px;border-radius:10px;font-size:13px;font-weight:600;box-shadow:0 12px 28px rgba(0,0,0,.25);display:flex;align-items:center;gap:8px;min-width:220px;animation:toastin .18s ease}
+.toast.success{background:#0d8a5f}
+.toast.error{background:var(--red)}
+@keyframes toastin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+
+/* ---------- Misc ---------- */
+.text-muted{color:var(--muted)}
+.mt-0{margin-top:0}
+.avatar-sm{width:26px;height:26px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:10.5px}
+.flex-row{display:flex;align-items:center;gap:8px}
+.section-title{font-size:15px;font-weight:800;margin-bottom:12px}
+.divider{height:1px;background:var(--line);margin:16px 0}
+.empty-state{text-align:center;padding:50px 20px;color:var(--muted)}
+.empty-state svg{width:44px;height:44px;color:#c6d7ee;margin-bottom:12px}
+.progress-track{height:6px;background:var(--gray-soft);border-radius:99px;overflow:hidden}
+.progress-fill{height:100%;background:linear-gradient(90deg,var(--blue),var(--cyan));border-radius:99px}
+.sales-perf-table td, .sales-perf-table th{white-space:nowrap}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+
+/* ---------- Project View v2: compact key-info block + collapsible sections ---------- */
+.pd-keyinfo{display:grid;grid-template-columns:1fr 1fr;gap:16px;background:var(--surface-2);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:18px}
+.pd-sections{display:flex;flex-direction:column;gap:10px}
+.pd-section{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--surface)}
+.pd-section-summary{list-style:none;display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer;font-size:13.5px;font-weight:700;color:var(--text);user-select:none}
+.pd-section-summary::-webkit-details-marker{display:none}
+.pd-section-summary::marker{content:''}
+.pd-section-caret{display:inline-flex;font-size:10px;color:var(--muted);transition:transform .15s ease}
+.pd-section[open] .pd-section-caret{transform:rotate(90deg)}
+.pd-section-summary:hover{background:var(--gray-soft)}
+.pd-section-body{padding:4px 16px 16px}
+@media(max-width:560px){
+  .pd-keyinfo{grid-template-columns:1fr}
+}
+
+/* Payment Recorded confirmation modal (js/payments.js openPaymentRecordedModal)
+   — "Update to Deposit Paid" / "Keep Current Status" action row stacks to
+   full-width buttons on narrow screens so neither label ever clips/overflows. */
+.pr-modal-foot{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+@media(max-width:480px){
+  .pr-modal-foot{flex-direction:column-reverse}
+  .pr-modal-foot .btn{width:100%}
+}
+
+/* ---------- Industry ranked bar charts (Dashboard) ---------- */
+.industry-bars-head{display:flex;align-items:baseline;justify-content:flex-end;gap:6px;margin:-6px 0 14px;text-align:right}
+.industry-bars-head .total-label{font-size:11px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.3px}
+.industry-bars-head .total-value{font-size:18px;color:var(--text);font-weight:800}
+.industry-bars-list{display:flex;flex-direction:column;justify-content:center;min-height:100%}
+.industry-bar-row{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+.industry-bar-row:last-child{margin-bottom:0}
+.industry-bar-label{width:150px;flex:0 0 150px;font-size:12.5px;font-weight:700;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.industry-bar-track{flex:1;height:10px;background:var(--gray-soft);border-radius:99px;overflow:hidden}
+.industry-bar-fill{height:100%;border-radius:99px;min-width:3px}
+.industry-bar-meta{flex:0 0 auto;width:100px;display:flex;justify-content:flex-end;gap:10px;font-size:12px}
+.industry-bar-amount{font-weight:800;color:var(--text);white-space:nowrap}
+.industry-bar-pct{font-weight:700;color:var(--muted);white-space:nowrap;width:32px;text-align:right}
+
+.summary-cards-5{grid-template-columns:repeat(5,1fr);margin-bottom:14px}
+.summary-cards-6{grid-template-columns:repeat(6,1fr)}
+/* 3-card row (Financial Performance row 2: Closed Sales Value, Collected
+   Revenue, Outstanding Balance) — same card/gap styling as .kpi-grid, just
+   a 3-column track instead of 4 so the row doesn't stretch too wide. */
+.kpi-grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:20px}
+.kpi-group .kpi-grid-3{margin-bottom:0}
+/* 5-card row (Sales Pipeline Value: Total Open Pipeline, Quote & Demo Sent,
+   Need Follow Up, Negotiation, Other Open Pipeline) — same card/gap styling
+   as .kpi-grid, just a 5-column track. */
+.kpi-grid-5{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:20px}
+.kpi-group .kpi-grid-5{margin-bottom:0}
+@media(max-width:1100px){
+  .kpi-grid{grid-template-columns:repeat(2,1fr)}
+  .kpi-grid-2{max-width:none}
+  .kpi-grid-3{grid-template-columns:repeat(2,1fr)}
+  .kpi-grid-5{grid-template-columns:repeat(3,1fr)}
+  .summary-cards-5{grid-template-columns:repeat(3,1fr)}
+  .summary-cards-6{grid-template-columns:repeat(3,1fr)}
+  .dash-grid{grid-template-columns:1fr}
+  .form-grid{grid-template-columns:1fr}
+  .two-col{grid-template-columns:1fr}
+}
+@media(max-width:880px){
+  .sidebar{transform:translateX(-100%)}
+  .sidebar.open{transform:translateX(0)}
+  .main-col{margin-left:0}
+  .menu-toggle-btn{display:flex;align-items:center;justify-content:center}
+  .kpi-grid{grid-template-columns:1fr 1fr}
+  .kpi-grid-3{grid-template-columns:1fr 1fr}
+  .kpi-grid-5{grid-template-columns:repeat(2,1fr)}
+  .content{padding:14px}
+}
+@media(max-width:560px){
+  .kpi-grid, .kpi-grid-2, .kpi-grid-3, .kpi-grid-5{grid-template-columns:1fr}
+  .summary-cards-5{grid-template-columns:repeat(2,1fr)}
+  .summary-cards-6{grid-template-columns:repeat(2,1fr)}
+  .modal-box{max-height:94vh}
+}
+@media(max-width:640px){
+  .industry-bar-label{width:100px;flex:0 0 100px;font-size:11.5px}
+  .industry-bar-meta{width:84px;gap:6px}
+}
+
+/* ---------- Dark-mode overrides for the handful of elements that use a
+   literal color instead of a theme token (mostly large tinted panels/pills
+   that would look too bright/washed-out against a dark page if left as
+   their light-mode literal) ---------- */
+[data-theme="dark"] .pipeline-col{background:#182338}
+[data-theme="dark"] .pipeline-col.drag-over{background:#20304a}
+[data-theme="dark"] .pcard .pcard-svc{background:#16233a}
+[data-theme="dark"] .btn-outline{border-color:#2a4a75}
+[data-theme="dark"] .btn-outline:hover{background:#16233a}
+[data-theme="dark"] .empty-state svg{color:#3a4a63}
+[data-theme="dark"] .form-field input:focus,
+[data-theme="dark"] .form-field select:focus,
+[data-theme="dark"] .form-field textarea:focus{outline-color:#2a4a75}
+
+/* Quotations "Coming Soon" empty state (spec: Settings/Quotations dark-mode
+   fix). Same light-mode literal values as before (10% blue / 10% amber
+   tints), moved from inline styles to classes so a dark-mode variant with
+   more opaque, higher-contrast tints can be layered on top without
+   touching the light theme. */
+.coming-soon-icon{background:#1d7bff1a;color:#1d7bff}
+.coming-soon-badge{background:#d98a121a;color:#d98a12}
+[data-theme="dark"] .coming-soon-icon{background:#1d7bff33;color:#5fa8ff}
+[data-theme="dark"] .coming-soon-badge{background:#d98a1233;color:#f0a83e}
+
+/* ---------- Quotation document (preview + print/PDF) ---------- */
+/* Deliberately NOT themed — this is a client-facing document meant to be
+   sent/printed, so it always renders as a clean light document regardless
+   of the CRM's own theme (same reasoning a print stylesheet always forces
+   light output). Re-declaring --line/--muted/--navy locally means every
+   var() reference inside .quote-doc keeps its light-mode value even when
+   an ancestor has [data-theme="dark"] set, without needing !important or
+   duplicating every rule below with hardcoded colors. */
+.quote-doc{
+  --line:#dce8f7; --muted:#526584; --navy:#071c3d;
+  color:var(--navy);
+  /* Root-cause Khmer-typography fix: this rule previously declared NO
+     font-family at all, so it silently inherited the page's Latin-only
+     body stack ('Inter', ... sans-serif) — Inter has no Khmer glyphs, so
+     every Khmer character in the document (all bilingual table labels)
+     fell back to whatever generic sans-serif the browser/OS substituted,
+     which is what read as "inconsistent / fallback-looking" Khmer. Adding
+     Noto Sans Khmer + Khmer OS to the END of the stack leaves English
+     completely untouched (Inter still renders every Latin character) and
+     relies on native per-glyph font fallback: the browser automatically
+     draws any character Inter lacks — i.e. every Khmer code point — using
+     the next font in the list. This fixes Khmer everywhere in the
+     document (title block, table labels, notes) with one line, and needs
+     no per-element markup.
+     NOTE: background/sizing/padding/shadow used to live on this rule when
+     .quote-doc was a single continuous flowing document. Those are now on
+     .quote-page instead (below) — .quote-doc itself is only ever used as a
+     shared typography/var base: applied to each real .quote-page AND to
+     the hidden measureQuoteDoc() host, so both measure and render with
+     identical font metrics. */
+  font-family:'Inter','Noto Sans Khmer','Khmer OS',-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
+}
+.quote-doc-loading{padding:60px 20px;text-align:center;color:var(--muted);font-size:13px}
+/* Khmer-specific type tuning (spec §3): Khmer glyphs sit slightly lower/
+   taller in their line box than Latin text at the same font-size, so a
+   shared line-height that looks fine for English can visually clip or
+   crowd Khmer. Bumping line-height only for Khmer runs (scoped to these
+   classes, not the whole document) avoids touching English typography. */
+.khmer-text,.khmer-label{
+  font-family:'Noto Sans Khmer','Khmer OS',sans-serif;
+  line-height:1.65;
+}
+/* Stacked bilingual table label (spec §4: Khmer first line, English
+   second line) — used by bilingualLabel() in js/quotations.js for the
+   Client Name / Business Name / Project / Date / Valid Until rows. Each
+   script keeps its own font (Khmer label gets the Khmer stack above; the
+   English line explicitly keeps the app's existing Inter-first stack so
+   it's never accidentally rendered in the Khmer font). Padding-bottom on
+   the Khmer line plus the infotable's own cell padding keeps Khmer
+   descenders/diacritics clear of the row border below. */
+.khmer-label{display:block;font-size:12.5px;font-weight:700;padding-bottom:2px}
+.en-label{display:block;font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:11px;font-weight:600;color:var(--muted);letter-spacing:.2px}
+.quote-doc-head{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:3px solid var(--blue);padding-bottom:16px;margin-bottom:16px}
+/* Official BizWeb KH branding in the quotation header (spec §4/§5): logo on
+   top, Tel/Telegram/website line below it — stacked, not the old side-by-side
+   "BW" box + text layout. The quote document is always rendered light/white
+   regardless of app theme, so only the main (navy/blue) logo variant is ever
+   needed here — no light/dark switching. Uses the pre-rendered PNG derivative
+   (assets/branding/bizweb-kh-logo-main-print.png) rather than the raw SVG:
+   the official SVG embeds an ~8.7k px raster behind filter-based recoloring,
+   which bloats generated PDFs to ~4.9MB; the PNG keeps the same look at a
+   fraction of the size for reliable print/PDF output (spec §7). */
+.quote-doc-brand{display:flex;flex-direction:column;align-items:flex-start;gap:6px}
+/* Fixed width AND height (not height:auto) — the real asset is 1200×328px
+   (2400/656 @2x), so 150px wide pins to 41px tall. Without an explicit
+   height, the very first measureQuoteDoc() pass can run before the image
+   has finished loading/decoding, measuring the header at its collapsed
+   (image-less) height and producing a page split that's briefly wrong
+   until the image loads and the layout reflows out from under it. */
+.quote-doc-logo{display:block;width:150px;max-width:60%;height:41px}
+.quote-doc-meta{text-align:right;font-size:12px;line-height:1.7}
+.quote-doc-clientbox{background:#f4f8ff;border-radius:8px;padding:12px 14px;margin-bottom:14px;font-size:13px;line-height:1.8}
+.quote-doc-h{font-size:12.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--blue);border-bottom:1px solid var(--line);padding-bottom:5px;margin:18px 0 8px}
+.quote-doc-table{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:4px}
+.quote-doc-table th{background:var(--blue);color:#fff;text-align:left;padding:8px 10px;font-weight:700}
+.quote-doc-table td{padding:8px 10px;border-bottom:1px solid var(--line)}
+/* justify-content:space-between (not a plain gap) so the two blocks spread
+   across the full page content width — the Representative block (now
+   carrying the signature image) visually shifts to the right edge instead
+   of sitting cramped right next to the Client block. */
+/* align-items:flex-end bottom-aligns the two columns. Both columns end in
+   an identical "sig-line + label" pair, so bottom-aligning the columns is
+   sufficient to make the sig-lines AND the labels land at the exact same
+   Y position on both sides — the Representative column's signature image
+   just pushes its own content up from the top, while the Client column's
+   now-empty top area becomes its natural signing space. No fixed spacer
+   height needed; verified empirically via Playwright bounding-rect diffs
+   (see smoketest/signature_block_test.js). */
+.quote-doc-accept{display:flex;justify-content:space-between;align-items:flex-end;gap:40px;margin-top:34px;margin-bottom:10px}
+.quote-doc-accept .sig-line{border-bottom:1px solid var(--muted);height:36px;min-width:170px}
+.quote-doc-accept span{font-size:11px;color:var(--muted)}
+.quote-doc-accept-client{display:flex;flex-direction:column}
+/* align-items:center so the signature image, its line and label all sit
+   centered over one another (previously flex-start, back when a stamp
+   wrapper handled its own internal centering — now the image is a direct
+   child so the column itself must center it). */
+.quote-doc-accept-rep{display:flex;flex-direction:column;align-items:center}
+/* Same fixed-width/height trick as .quote-doc-logo and .quote-doc-qr-img
+   (real <img> tags with explicit width/height attributes in quotations.js)
+   — both dimensions pinned here too so the image can't still be mid-load
+   at the very first measureQuoteDoc() pass and throw off pagination.
+   object-fit:contain guards against any future width/height edit
+   introducing distortion (current px size already matches the PNG's
+   native 219:77 aspect ratio, so today this is a no-op safety net).
+   The trailing .sig-line is a 36px-tall EMPTY box (no fill, just a
+   border-bottom) — that height exists to give the *client* physical room
+   to hand-sign above their line. For the rep column, an image already IS
+   the signature, so without correction that same 36px shows up as dead
+   air between the image and the actual line. A strong negative
+   margin-bottom pulls the (borderless, fill-less) sig-line box up
+   underneath the image — safe to overlap since nothing but its bottom
+   border is ever visible — leaving only ~4px between the image's own
+   bottom edge and the line; the signature PNG's own ~2-3px of internal
+   transparent padding on top of that reads as a small, natural gap
+   rather than the signature floating or touching/crossing the line.
+   Verified via real Chromium bounding-rect renders (see task report /
+   smoketest/signature_block_test.js) that this does not affect the
+   flex-end column-bottom alignment with the client column. */
+.quote-doc-accept-sig{display:block;width:194px;height:68px;object-fit:contain;margin-bottom:-32px}
+
+/* Bilingual client-info table (matches the real BizWeb KH quotation layout —
+   e.g. C039 Engly Khun / C001 IIA Education reference documents) and the
+   two-column Important Notes + Bank Details block at the bottom. */
+.quote-doc-infotable{width:100%;border-collapse:collapse;font-size:12.5px;margin-bottom:14px;border:1px solid var(--line)}
+.quote-doc-infotable th{background:#f4f8ff;color:var(--navy);text-align:left;padding:10px 12px;width:34%;font-weight:700;border-bottom:1px solid var(--line);vertical-align:top}
+.quote-doc-infotable td{padding:8px 10px;border-bottom:1px solid var(--line)}
+.quote-doc-infotable tr:last-child th, .quote-doc-infotable tr:last-child td{border-bottom:none}
+.quote-doc-bottom{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:16px}
+@media (max-width:640px){ .quote-doc-bottom{grid-template-columns:1fr} }
+
+/* ---------- A4 pagination engine (real pages, not a flowed document) ----------
+   Replaces the old single continuous .quote-doc sheet. buildQuotePagesHtml()
+   in js/quotations.js measures real content at A4 width and packs it into N
+   discrete .quote-page nodes; this CSS just gives each one true A4 paper
+   dimensions and a stack of them (.quote-pages-wrap) a visible gap so page
+   boundaries are unambiguous both on screen and on paper (spec §4/§15). */
+.quote-pages-wrap{display:flex;flex-direction:column;align-items:center;gap:28px}
+.quote-page{
+  position:relative;box-sizing:border-box;
+  width:210mm;height:297mm;padding:15mm;
+  background:#fff;box-shadow:0 10px 30px rgba(7,20,45,.12);border-radius:2px;overflow:hidden;
+  /* Brand colors (table header bars, blue rule under the logo, etc.) must
+     stay visible even if the browser's "Background graphics" print option
+     is off (spec §12) — Chrome/Edge/Firefox all honor this exact
+     declaration to force those backgrounds through regardless. */
+  print-color-adjust:exact;-webkit-print-color-adjust:exact;
+}
+.quote-page-body{font-size:12.5px}
+.quote-page-cont-head-wrap{margin-bottom:14px}
+.quote-doc-cont-head{
+  font-size:10.5px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.3px;
+  border-bottom:1px solid var(--line);padding-bottom:8px;
+}
+.quote-doc-footer{
+  position:absolute;left:15mm;right:15mm;bottom:7mm;
+  font-size:9.5px;color:var(--muted);text-align:center;
+  border-top:1px solid var(--line);padding-top:5px;
+}
+
+/* Scope of Work groups (one per module) — each kept whole across a page
+   break wherever it fits (spec §7's "don't split a scope item line"). */
+.quote-doc-scopegroup{margin-bottom:10px;break-inside:avoid;page-break-inside:avoid}
+.quote-doc-scopegroup-title{font-size:12px;font-weight:700;color:var(--navy);margin-bottom:4px}
+.quote-doc-scopegroup-list{margin:0;padding-left:20px;font-size:12.5px;line-height:1.7}
+.quote-doc-scopegroup-list li{break-inside:avoid;page-break-inside:avoid}
+
+/* Important Notes — replaces the old inline-styled <ol>. */
+.quote-doc-notes-list{margin:0;padding-left:20px;font-size:12.5px;line-height:1.75}
+.quote-doc-notes-list li{margin-bottom:6px;break-inside:avoid;page-break-inside:avoid}
+
+/* Bank details box — replaces the old inline-styled <div>; heading and
+   value always travel together (spec §7). Two-column card: bank details
+   left, KHQR right. break-inside/page-break-inside:avoid (both — Chrome/
+   Edge honor break-inside, Firefox's print engine still wants the legacy
+   page-break-inside alias) keeps the whole card — title, details, QR —
+   together on one page; if it doesn't fit it flows whole onto the next
+   page rather than splitting mid-card. */
+.quote-doc-bankbox{
+  display:grid;grid-template-columns:1fr auto;gap:18px;align-items:start;
+  background:#f4f8ff;border:1px solid #dce8f7;border-radius:8px;padding:14px 16px;font-size:12.5px;line-height:1.9;
+  break-inside:avoid;page-break-inside:avoid;
+}
+.quote-doc-bankbox-details > div{padding:1px 0}
+.quote-doc-bankbox-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--blue);margin-bottom:4px}
+.quote-doc-bankbox-qr{
+  display:flex;flex-direction:column;align-items:center;text-align:center;
+  min-width:180px;padding-left:16px;border-left:1px solid #dce8f7;
+}
+.quote-doc-qr-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--blue);margin-bottom:6px}
+/* Fixed square frame with its own quiet-zone padding around the QR image —
+   nothing (captions, borders) overlaps the code itself. Real <img> (not a
+   CSS background-image) so it always renders in print/PDF output; explicit
+   width/height attributes on the <img> (see quotations.js) plus
+   aspect-ratio here mean the box occupies its final size immediately, the
+   same fixed-dimensions trick already used for .quote-doc-logo, so no
+   pagination measurement runs against a collapsed/pre-load height. */
+.quote-doc-qr-frame{
+  /* Bumped from 168px -> 190px (2026-09-14 KHQR scanability fix): a modest
+     ~13% size increase to give the dense KHQR pattern more physical/pixel
+     area in the preview, print, and PDF output, without changing the
+     bank-details card's layout -- the grid column this sits in
+     (.quote-doc-bankbox-qr, min-width:180px) already reserved room for
+     roughly this size. Everything else about the frame (white background,
+     border, radius, centered quiet-zone padding) is unchanged. */
+  width:190px;height:190px;aspect-ratio:1/1;background:#fff;border:1px solid #dce8f7;border-radius:6px;
+  padding:14px;box-sizing:border-box;display:flex;align-items:center;justify-content:center;
+}
+/* object-fit:contain (unchanged) already renders the source image at its
+   own native aspect ratio without stretching, letterboxed inside this box
+   if needed -- the KHQR source (570x555, not a perfect square) was never
+   actually distorted. No image-rendering override is set here: the
+   browser's default smooth/high-quality downscaling is correct for
+   shrinking a real photo/render like this KHQR asset (pixelated/crisp-edges
+   is for upscaling pixel art and would look worse, not better, here). */
+.quote-doc-qr-img{display:block;width:100%;height:100%;object-fit:contain}
+.quote-doc-qr-caption{font-size:12px;font-weight:700;color:var(--navy);margin-top:8px}
+.quote-doc-qr-help{font-size:10.5px;color:var(--muted);margin-top:2px;max-width:170px}
+@media (max-width:640px){
+  .quote-doc-bankbox{grid-template-columns:1fr}
+  .quote-doc-bankbox-qr{border-left:none;border-top:1px solid #dce8f7;padding-left:0;padding-top:14px;margin-top:4px}
+}
+
+/* Table rows / signature block must never split mid-row (spec §7). */
+.quote-doc-table tr{break-inside:avoid;page-break-inside:avoid}
+.quote-doc-accept{break-inside:avoid;page-break-inside:avoid}
+
+@media print{
+  /* Hide every ordinary CRM element (nav, modal chrome, zoom controls, the
+     on-screen preview copy, etc.) and print ONLY the dedicated body-level
+     copy that printQuoteDocFromContainer() creates — #qcPrintRoot. This
+     replaces the old "hide everything, absolute-position one flowing node
+     back into view" hack, which depended on that node's ancestors (the
+     preview modal's own scrollable, height-capped .modal-box) never
+     clipping it — the actual root cause of content being lost after part
+     of the Payment Schedule (spec §17/§18). #qcPrintRoot is appended
+     directly to <body>, outside every modal, so nothing about the modal's
+     layout can affect it. */
+  body > *:not(#qcPrintRoot){display:none!important}
+  #qcPrintRoot{display:block!important;position:static;visibility:visible}
+  #qcPrintRoot .quote-pages-wrap{gap:0}
+  #qcPrintRoot .quote-page{
+    box-shadow:none;border-radius:0;margin:0;
+    width:210mm;height:297mm;
+    break-after:page;page-break-after:always;
+  }
+  #qcPrintRoot .quote-page:last-child{break-after:auto;page-break-after:auto}
+  @page{ size:A4 portrait; margin:0 }
+}
+
+/* ---------- Invoice document layout (compact, one-page-first A4) ----------
+   Only the Invoice module uses the .inv-* classes — Quotations keep their own
+   .quote-doc-* styling untouched. Same A4 pagination engine (.quote-page). */
+.inv-head{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;border-bottom:3px solid var(--blue);padding-bottom:10px;margin-bottom:12px}
+.inv-brand{display:flex;flex-direction:column;gap:5px}
+.inv-contact{font-size:10.5px;color:var(--muted)}
+.inv-head-right{text-align:right}
+.inv-title-km{font-size:12.5px;color:var(--blue);font-weight:700;line-height:1.5}
+.inv-title-en{font-size:24px;font-weight:800;letter-spacing:1.5px;color:var(--navy);line-height:1.1}
+.inv-title-en.inv-title-long{font-size:15px;letter-spacing:.6px;line-height:1.25;max-width:300px;margin-left:auto}
+.inv-meta{font-size:11.5px;color:var(--muted);margin-top:5px}
+.inv-meta b{color:var(--navy)}
+.inv-km{font-size:.92em;font-weight:500}
+.inv-twocol{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:8px}
+.inv-card{border:1px solid var(--line);border-radius:8px;background:#f8fbff;padding:8px 12px;overflow-wrap:anywhere;word-break:normal}
+.inv-card-h{font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:var(--blue);font-weight:700;margin-bottom:5px}
+.inv-client{font-size:13px;font-weight:700;line-height:1.35;color:var(--navy)}
+.inv-biz{font-size:12px;margin-top:2px}
+.inv-sub{font-size:11px;color:var(--muted);margin-top:2px}
+.inv-kv-row,.inv-bank-row{display:grid;grid-template-columns:44% 1fr;gap:8px;font-size:11.5px;line-height:1.45;padding:1px 0}
+.inv-bank-row{grid-template-columns:32% 1fr}
+.inv-k{color:var(--muted)}
+.inv-v{overflow-wrap:anywhere}
+.inv-strip{display:grid;grid-template-columns:1fr 1.5fr;gap:12px;margin-bottom:10px}
+.inv-stat{border-left:4px solid var(--blue);background:#eef4ff;border-radius:6px;padding:6px 12px}
+.inv-stat-label{font-size:10px;letter-spacing:.4px;text-transform:uppercase;color:var(--muted);font-weight:700;margin-bottom:2px}
+.inv-stat-label .inv-km{display:block;text-transform:none;letter-spacing:0;font-weight:500}
+.inv-stat-value{font-size:19px;font-weight:800;color:var(--navy);line-height:1.2}
+.inv-stat-text{font-size:13px;font-weight:700;color:var(--navy);line-height:1.4;padding-top:2px;overflow-wrap:anywhere}
+.inv-h{font-size:10.5px;letter-spacing:.5px;text-transform:uppercase;color:var(--blue);font-weight:700;margin:0 0 5px}
+.inv-h2{font-size:10px;letter-spacing:.4px;text-transform:uppercase;color:var(--blue);font-weight:700;margin:0 0 3px}
+.inv-items{width:100%;border-collapse:collapse;table-layout:fixed;font-size:11.5px}
+.inv-items th{background:var(--blue);color:#fff;text-align:left;padding:6px 8px;font-size:10.5px;font-weight:700}
+.inv-items td{padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere;word-break:normal}
+.inv-items tbody{break-inside:avoid;page-break-inside:avoid}
+.inv-items .inv-c-qty{text-align:center}
+.inv-items .inv-c-amt{text-align:right;white-space:nowrap}
+.inv-items .inv-c-no{color:var(--muted)}
+.inv-item-term{color:var(--blue);font-weight:600;white-space:nowrap}
+.inv-item-sub{font-size:10px;color:var(--muted);margin-top:1px}
+.inv-empty{text-align:center;color:var(--muted)}
+.inv-items tr.inv-sumrow td{padding:8px 0 0;border-bottom:none}
+.inv-sumwrap{display:grid;grid-template-columns:1fr 280px;gap:18px;align-items:start}
+.inv-p{font-size:11px;line-height:1.5;margin:0 0 8px;color:var(--navy);overflow-wrap:anywhere}
+.inv-notes{white-space:pre-wrap}
+.inv-sum{border:1px solid var(--line);border-radius:8px;padding:6px 12px 8px;background:#fff}
+.inv-sum-row{display:flex;justify-content:space-between;gap:12px;font-size:11.5px;line-height:1.45;padding:3px 0}
+.inv-sum-row span:last-child{white-space:nowrap;font-variant-numeric:tabular-nums}
+.inv-sum-strong{font-weight:700}
+.inv-sum-remaining span:first-child{max-width:160px}
+.inv-due{display:flex;justify-content:space-between;align-items:center;gap:10px;background:var(--navy);color:#fff;border-radius:6px;padding:8px 12px;margin:6px -4px;print-color-adjust:exact;-webkit-print-color-adjust:exact}
+.inv-due-label{font-size:10.5px;letter-spacing:.4px;font-weight:700;line-height:1.35;white-space:nowrap}
+.inv-due-label .inv-km{display:block;font-weight:500;letter-spacing:0}
+.inv-due-val{font-size:20px;font-weight:800;white-space:nowrap}
+.inv-sum-sep{border-top:1px dashed var(--line);margin:4px 0}
+.inv-bank{display:grid;grid-template-columns:1fr auto;gap:16px;align-items:center;margin-top:10px;background:#f4f8ff;border:1px solid var(--line);border-radius:8px;padding:8px 14px;break-inside:avoid;page-break-inside:avoid}
+.inv-bank-note{font-size:10.5px;color:var(--muted);margin:6px 0 0;line-height:1.4}
+.inv-bank-qr{display:flex;flex-direction:column;align-items:center;text-align:center;border-left:1px solid var(--line);padding-left:16px}
+.inv-qr-frame{width:140px;height:140px;box-sizing:border-box;padding:5px;background:#fff;border:1px solid var(--line);border-radius:6px;display:flex;align-items:center;justify-content:center}
+.inv-qr-caption{font-size:11px;font-weight:700;color:var(--navy);margin-top:5px}
+.inv-sign{display:flex;justify-content:space-between;align-items:flex-end;gap:40px;margin-top:10px;break-inside:avoid;page-break-inside:avoid}
+.inv-sign-col{display:flex;flex-direction:column;min-width:190px}
+.inv-sign-col .sig-line{border-bottom:1px solid var(--muted);height:30px}
+.inv-sign-col span{font-size:10.5px;color:var(--muted);margin-top:3px}
+.inv-sign-rep{align-items:center}
+.inv-sign-img{display:block;width:150px;height:53px;object-fit:contain;margin-bottom:-26px}
+
+/* ---------- Create Quotation: live split-view (Edit | Preview) ---------- */
+/* Tabs now live inside .modal-head (next to the title, before the Close
+   button) so they stay visible/sticky regardless of scroll position —
+   hidden by default on wide desktop layouts where the split view fits
+   side-by-side, shown only under the narrow-width breakpoint below. */
+.qc-tabs{display:none;gap:4px}
+.qc-tabs .tab-btn{padding:7px 12px;font-size:12.5px}
+.qc-split{
+  display:grid;grid-template-columns:44% 56%;gap:0;align-items:stretch;
+  flex:1 1 auto;min-height:0;height:100%;
+}
+.qc-edit-col{min-width:0;overflow-y:auto;padding:20px 22px}
+.qc-preview-col{
+  position:static;min-width:0;overflow:hidden;
+  display:flex;flex-direction:column;
+  border-left:1px solid var(--line);background:var(--surface-2);
+}
+/* Toolbar: preview title + Fit/100%/−/+ zoom controls (spec §10). Pinned
+   at the top of the preview column (not part of the scrolling canvas
+   below it) so zoom controls stay reachable no matter how far the A4 page
+   has been scrolled. */
+.qc-preview-toolbar{
+  flex:0 0 auto;display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:12px 16px;border-bottom:1px solid var(--line);background:var(--surface);
+}
+.qc-preview-toolbar-title{font-size:12.5px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+.qc-zoom-controls{display:flex;align-items:center;gap:4px}
+.qc-zoom-controls [data-zoom]{border:1px solid var(--line)}
+.qc-zoom-controls [data-zoom].active{background:var(--blue);border-color:var(--blue);color:#fff}
+/* Preview canvas: the neutral/light-gray (dark-mode: neutral/dark)
+   workspace the A4 page sits in — spec §9 ("Quotation Preview" wrapper).
+   Uses --surface-2 so it automatically follows the CRM's own theme, while
+   .quote-doc itself keeps its hardcoded white background (below) so the
+   document always looks like printable paper regardless of theme. This is
+   the single scrollable region for the whole preview column — vertical
+   scroll allowed, horizontal never (so an oversized zoom never clips the
+   page sideways; it simply requires scrolling down instead). */
+.qc-preview-canvas{
+  flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;
+  padding:24px 16px;display:flex;justify-content:center;
+}
+/* Fixed physical A4 width (210mm @ 96dpi ≈ 794px); CSS zoom (applied via
+   JS — see qcApplyZoom in js/quotations.js) scales this box down/up as a
+   real layout operation, so the scroll container's height tracks the
+   scaled page automatically with no manual height math. transform:scale
+   was deliberately avoided here for that reason. */
+.qc-a4-scale{width:794px;flex:0 0 auto}
+/* Each real .quote-page is already true A4 width (210mm ≈ 794px, matching
+   .qc-a4-scale above) — .quote-pages-wrap's own align-items:center is what
+   keeps every page centered in the column, so no width override is needed
+   here (unlike the old single-.quote-doc layout, which stretched to fill
+   its container). */
+.qc-preview-col .quote-pages-wrap{width:100%}
+@media (max-width:1150px){
+  .qc-tabs{display:flex}
+  .qc-split{display:block;height:auto;overflow-y:auto}
+  .qc-split [data-hide-narrow]{display:none}
+  .qc-edit-col,.qc-preview-col{overflow:visible}
+  .qc-preview-col{border-left:0}
+}

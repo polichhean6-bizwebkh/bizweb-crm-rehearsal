@@ -1,0 +1,1 @@
+REHEARSAL site for the BizWeb KH CRM Neon migration. Connected to the Neon rehearsal backend only. Never copy this folder to the production repository or crm.bizwebkh.com.

@@ -1,0 +1,2600 @@
+/* ==========================================================================
+   BizWeb KH CRM — quotations.js
+   Quotations MVP: list + summary cards, Create Quotation (lead/opportunity
+   autocomplete -> auto-fill -> package/scope/pricing/payment schedule ->
+   live A4 preview), Sales-authority + Founder-review workflow, versioning
+   (edit-after-Sent creates a new revision, old one -> Superseded), branded
+   bilingual preview + PDF (browser print), and Accepted -> Convert to
+   Project.
+   ========================================================================== */
+
+function isFounder(){ return /Founder/i.test(CURRENT_USER.role); }
+function discountLimitPct(){ const db = DB.read(); return (db && db.settings && db.settings.discountLimitPct) || 10; }
+// A service's own Maximum Sales Discount (set on the Service Price List)
+// overrides the global default when present.
+function effectiveDiscountLimit(svc){ return (svc && svc.maxDiscountPct!=null) ? svc.maxDiscountPct : discountLimitPct(); }
+
+const QUOTATIONS_MODULE_ENABLED = true;
+
+/* ---------------------------------------------------------------------- */
+/* List page                                                              */
+/* ---------------------------------------------------------------------- */
+
+let QUOT_FILTER = { search:'', status:'', sales:'' };
+
+function renderQuotationsPage(){
+  const el = document.getElementById('pageContent');
+  el.innerHTML = `
+    <div id="quotSummaryCards"></div>
+    <div class="filters-bar">
+      <div class="search-box">
+        ${icon('search')}
+        <input type="text" id="qSearch" placeholder="Search quote no., project code, client, or business…" value="${escapeHtml(QUOT_FILTER.search)}">
+      </div>
+      <select id="qFltStatus" class="sel"><option value="">All Statuses</option>${QUOTATION_STATUSES.map(s=>`<option ${QUOT_FILTER.status===s?'selected':''}>${s}</option>`).join('')}</select>
+      <select id="qFltSales" class="sel"><option value="">All Sales</option>${salesOwnersList().map(s=>`<option ${QUOT_FILTER.sales===s?'selected':''}>${s}</option>`).join('')}</select>
+      <div class="spacer"></div>
+      <button class="btn btn-primary" id="createQuoteBtn">${icon('quote')} + Create Quotation</button>
+    </div>
+    <div id="quotTableWrap"></div>
+  `;
+  document.getElementById('qSearch').oninput = e=>{ QUOT_FILTER.search=e.target.value; renderQuotTable(); };
+  document.getElementById('qFltStatus').onchange = e=>{ QUOT_FILTER.status=e.target.value; renderQuotTable(); };
+  document.getElementById('qFltSales').onchange = e=>{ QUOT_FILTER.sales=e.target.value; renderQuotTable(); };
+  document.getElementById('createQuoteBtn').onclick = ()=> openCreateQuotationModal();
+  renderQuotSummaryCards();
+  renderQuotTable();
+}
+
+// Live quotations = everything except Superseded (historical-only, reached
+// via a newer revision's Version History) — never counted or listed here
+// unless the user explicitly filters the Status dropdown to "Superseded".
+function liveQuotations(){
+  return DB.all('quotations').filter(q=>q.status!=='Superseded');
+}
+
+function renderQuotSummaryCards(){
+  const wrap = document.getElementById('quotSummaryCards');
+  const list = liveQuotations();
+  const draft = list.filter(q=>q.status==='Draft').length;
+  // Root-cause fix (BizWeb CRM -- Replace Founder Review with Configurable
+  // Package Add-On Pricing): "Awaiting Approval" no longer exists as a
+  // status any quotation can reach -- replaced with a "Needs Pricing"
+  // count (Draft quotations still carrying an unresolved Manual-price
+  // item), which is the one thing that can still hold up a quotation.
+  const needsPricing = list.filter(q=>q.status==='Draft' && q.priceIsTBC).length;
+  const sent = list.filter(q=>quotationDisplayStatus(q)==='Sent').length;
+  const accepted = list.filter(q=>q.status==='Accepted').length;
+  const totalValue = list.reduce((s,q)=> s + (Number(q.year1Total)||0), 0);
+  wrap.innerHTML = `
+    <div class="kpi-grid summary-cards-5" style="margin-bottom:14px">
+      <div class="kpi-card" style="padding:12px 14px"><div class="kpi-value" style="font-size:20px">${draft}</div><div class="kpi-label" style="margin-top:4px">Draft</div></div>
+      <div class="kpi-card" style="padding:12px 14px"><div class="kpi-value" style="font-size:20px;color:var(--amber)">${needsPricing}</div><div class="kpi-label" style="margin-top:4px">Needs Pricing</div></div>
+      <div class="kpi-card" style="padding:12px 14px"><div class="kpi-value" style="font-size:20px;color:var(--blue)">${sent}</div><div class="kpi-label" style="margin-top:4px">Sent</div></div>
+      <div class="kpi-card" style="padding:12px 14px"><div class="kpi-value" style="font-size:20px;color:var(--green)">${accepted}</div><div class="kpi-label" style="margin-top:4px">Accepted</div></div>
+      <div class="kpi-card" style="padding:12px 14px"><div class="kpi-value" style="font-size:20px">${moneyPrecise(totalValue)}</div><div class="kpi-label" style="margin-top:4px">Total Quoted Value</div></div>
+    </div>
+  `;
+}
+
+function filteredQuotations(){
+  const f = QUOT_FILTER;
+  const base = f.status==='Superseded' ? DB.all('quotations') : liveQuotations();
+  return base.filter(q=>{
+    if(f.search){
+      const s = f.search.toLowerCase();
+      const hay = [q.quoteNumber, q.projectCode, q.clientName, q.businessName].filter(Boolean).join(' ').toLowerCase();
+      if(!hay.includes(s)) return false;
+    }
+    if(f.status && quotationDisplayStatus(q)!==f.status && q.status!==f.status) return false;
+    if(f.sales && q.assignedSales!==f.sales) return false;
+    return true;
+  }).sort((a,b)=> new Date(b.createdAt)-new Date(a.createdAt));
+}
+
+function renderQuotTable(){
+  const wrap = document.getElementById('quotTableWrap');
+  const rows = filteredQuotations();
+  wrap.innerHTML = `
+    <div class="table-wrap scroll-x">
+      <table class="data-table">
+        <thead><tr>
+          <th>Quote No.</th><th>Project Code</th><th>Client / Business</th><th>Package</th><th>Amount</th>
+          <th>Sales</th><th>Status</th><th>Date</th><th>Valid Until</th><th>Actions</th>
+        </tr></thead>
+        <tbody>
+          ${rows.length ? rows.map(q=>`
+            <tr>
+              <td class="cell-link" data-open="${q.id}">${q.quoteNumber}${q.version>1?` <span class="text-muted" style="font-weight:400">v${q.version}</span>`:''}</td>
+              <td>${escapeHtml(q.projectCode||'—')}</td>
+              <td><div class="cell-strong">${escapeHtml(q.clientName)}</div>${q.businessName?`<div class="text-muted" style="font-size:11.5px">${escapeHtml(q.businessName)}</div>`:''}</td>
+              <td>${escapeHtml(q.packageName||q.packageKey||'')}</td>
+              <td class="cell-strong">${q.priceIsTBC?'TBC':moneyPrecise(q.year1Total)}</td>
+              <td><div class="flex-row"><div class="avatar-sm" style="background:${userColor(q.assignedSales)}">${userInitials(q.assignedSales)}</div>${escapeHtml(q.assignedSales)}</div></td>
+              <td>${statusBadge(quotationDisplayStatus(q))}</td>
+              <td>${fmtDate(q.quotationDate||q.createdAt)}</td>
+              <td>${fmtDate(q.validUntil)}</td>
+              <td>
+                <div class="flex-row" style="gap:6px;flex-wrap:wrap">
+                  <button class="btn btn-secondary btn-sm" data-open="${q.id}">View</button>
+                  <button class="btn btn-ghost btn-sm" data-dup="${q.id}">Duplicate</button>
+                  <button class="btn btn-ghost btn-sm" data-pdf="${q.id}">PDF</button>
+                </div>
+              </td>
+            </tr>`).join('') : `<tr><td colspan="10"><div class="empty-row">No quotations yet. Use "+ Create Quotation" to start one.</div></td></tr>`}
+        </tbody>
+      </table>
+    </div>
+    <p class="text-muted" style="margin-top:10px;font-size:12px">Showing ${rows.length} of ${liveQuotations().length} quotations</p>
+  `;
+  wrap.querySelectorAll('[data-open]').forEach(x=> x.onclick = ()=> openQuotationDetailModal(x.dataset.open));
+  wrap.querySelectorAll('[data-pdf]').forEach(x=> x.onclick = ()=> openQuotationPreview(x.dataset.pdf, true));
+  wrap.querySelectorAll('[data-dup]').forEach(x=> x.onclick = ()=> duplicateQuotation(x.dataset.dup));
+}
+
+function duplicateQuotation(id){
+  const q = DB.find('quotations', id);
+  if(!q) return;
+  openCreateQuotationModal({ leadId: q.leadId, sourceType: q.leadId ? 'lead' : 'new', duplicateFrom: q.id });
+}
+
+/* ---------------------------------------------------------------------- */
+/* Create Quotation — Step 1: lead / opportunity autocomplete             */
+/* ---------------------------------------------------------------------- */
+
+let QC_STATE = null;
+let QC_TAB = 'edit'; // 'edit' | 'preview' — used on narrow screens only
+// Live preview zoom: 'fit' (recomputed to the panel's current width) or a
+// literal scale factor (1 = 100%). Typography/layout fix — purely a screen
+// convenience, never applied to the printed/PDF document itself.
+let QC_ZOOM = 'fit';
+const QC_A4_PAGE_WIDTH_PX = 794; // 210mm at 96dpi — the physical page width the preview scales from
+
+/* ---------------------------------------------------------------------- */
+/* Unsaved-changes protection (spec: "CRM – Prevent Accidental Loss of     */
+/* Unsaved Quotation") — a snapshot of QC_STATE taken the moment a         */
+/* Create/Edit Quotation session genuinely BEGINS (a brand-new blank form, */
+/* a form prefilled from a lead, or an existing quotation loaded for       */
+/* editing), compared against the CURRENT QC_STATE whenever the user tries */
+/* to close via the background overlay, the X button, Cancel, or Escape.   */
+/* QC_TAB/QC_ZOOM (view-only: which tab is active, preview zoom level) are */
+/* deliberately separate module-level variables, never part of QC_STATE,   */
+/* so switching tabs or zooming the live preview can never itself mark the */
+/* form dirty — only an actual change to a real quotation field can.       */
+/* `null` means "no active tracked session" (modal not open, or the        */
+/* session already concluded via Save/Discard) — the guard always allows a */
+/* normal close in that state, so this can never misfire for any other     */
+/* modal in the app (only Create/Edit Quotation ever sets it).             */
+let QC_DIRTY_BASELINE = null;
+
+// Deliberately snapshots the WHOLE of QC_STATE — every field the spec lists
+// as "meaningful" (source, lead/client, client name, business name, phone,
+// Telegram, industry, assigned sales, package, quotation date, valid until,
+// demo link, scope/items, pricing/year budget, notes, and any custom field)
+// already lives directly on QC_STATE, and nothing else does: the derived
+// preview/total numbers (evalRes, totals, schedule, the quote-number
+// preview) are recomputed fresh from QC_STATE on every render rather than
+// stored on it, so they can never leak into this snapshot and can never by
+// themselves mark the form dirty.
+//
+// Uses a key-order-independent stringify rather than plain JSON.stringify.
+// QC_STATE.annualCost in particular is re-normalized (normalizeAnnualCost())
+// on every render purely so the live-editing handlers have a consistent
+// object shape to mutate — this rebuilds the object with the SAME values
+// but a different property insertion order, which plain JSON.stringify
+// treats as "changed" even though nothing the user can see or control
+// actually changed. That's exactly the "automatically generated ... alone
+// should not unnecessarily mark the form dirty" case the spec calls out, so
+// the comparison here is made order-independent instead of chasing every
+// such normalization individually.
+function qcStableStringify(value){
+  if(Array.isArray(value)) return '[' + value.map(qcStableStringify).join(',') + ']';
+  if(value && typeof value==='object'){
+    return '{' + Object.keys(value).sort().map(k=> JSON.stringify(k)+':'+qcStableStringify(value[k])).join(',') + '}';
+  }
+  return JSON.stringify(value);
+}
+function qcSnapshot(state){ return qcStableStringify(state); }
+
+// Call once, right after QC_STATE is set to its STARTING values for a new
+// editing session (before the first render) — never on every remount, or
+// every keystroke would immediately reset the baseline to "no changes yet"
+// and the warning could never fire.
+function qcArmDirtyTracking(){ QC_DIRTY_BASELINE = qcSnapshot(QC_STATE); }
+function qcIsDirty(){ return QC_DIRTY_BASELINE!==null && qcSnapshot(QC_STATE)!==QC_DIRTY_BASELINE; }
+// Ends the tracked session outright (Discard, or a successful Save moving
+// on to a different modal) — no more guard/beforeunload protection until a
+// new session is armed.
+function qcEndDirtyTracking(){ QC_DIRTY_BASELINE = null; qcSetBeforeUnloadGuard(false); }
+
+// Browser-level protection (spec: "if practical") — a standard beforeunload
+// prompt, enabled ONLY while a quotation session is actually dirty, and
+// removed the instant it isn't (save, discard, or the user simply closes
+// with no changes) so it can never nag on unrelated navigation elsewhere in
+// the app.
+function qcBeforeUnloadHandler(e){ e.preventDefault(); e.returnValue = ''; return ''; }
+function qcSetBeforeUnloadGuard(on){
+  window.removeEventListener('beforeunload', qcBeforeUnloadHandler);
+  if(on) window.addEventListener('beforeunload', qcBeforeUnloadHandler);
+}
+
+// The registered modal-close guard (setModalCloseGuard, app.js) for
+// Create/Edit Quotation — consulted by requestCloseModal() whenever the
+// user tries to close via the background overlay, the X button, or Escape
+// (Cancel calls requestCloseModal() directly too, see wireCreateQuotation
+// Modal below). Returning anything but `false` allows the close to proceed
+// immediately; returning `false` blocks it and shows the confirmation
+// dialog instead, exactly like every other guard-consuming caller.
+function quotationModalCloseGuard(){
+  if(!qcIsDirty()) { qcEndDirtyTracking(); return true; }
+  openQuotationUnsavedChangesDialog();
+  return false;
+}
+
+// The "Unsaved quotation" confirmation dialog — rendered as a CHILD modal
+// (openChildModal/closeChildModal, see the big comment on those in app.js)
+// so it can never touch or reset the parent Create/Edit Quotation modal's
+// own overlay, scroll position, or in-progress form state, exactly the
+// same established pattern already used for "Add Scope Item".
+function openQuotationUnsavedChangesDialog(){
+  const html = `
+    <div class="modal-head"><h3>Unsaved quotation</h3></div>
+    <div class="modal-body">
+      <p>You have unsaved changes. Would you like to save this quotation as a draft before closing?</p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-secondary" id="qucContinue">Continue Editing</button>
+      <button class="btn btn-danger" id="qucDiscard">Discard Changes</button>
+      <button class="btn btn-primary" id="qucSave">Save as Draft</button>
+    </div>
+  `;
+  openChildModal(html, { onMount:(overlay)=>{
+    // Continue Editing — closes only the warning dialog; the parent modal
+    // and every entered field are completely untouched (we never wrote to
+    // QC_STATE or the parent overlay at all).
+    overlay.querySelector('#qucContinue').onclick = ()=> closeChildModal();
+    // Discard Changes — closes the warning dialog, ends the tracked
+    // session, discards QC_STATE, and force-closes the parent (closeModal()
+    // is guard-free/unconditional, which is correct here: the user just
+    // explicitly chose to discard, so no further confirmation should fire).
+    overlay.querySelector('#qucDiscard').onclick = ()=>{
+      closeChildModal();
+      qcEndDirtyTracking();
+      QC_STATE = null;
+      closeModal();
+    };
+    // Save as Draft — reuses the EXACT SAME saveQuotationFromState() the
+    // form's own bottom Save button calls (no second draft-save
+    // implementation). That function already: validates required fields
+    // and toasts+returns on failure (leaving the parent modal open with the
+    // error visible — exactly "if save fails, keep modal open and show the
+    // error"), and on success ends the dirty session + closes the parent
+    // modal itself (see the two lines added there). We only close the
+    // warning dialog first so it doesn't linger through either outcome.
+    overlay.querySelector('#qucSave').onclick = function(){ return runSave(this, async ()=>{
+      closeChildModal();
+      await saveQuotationFromState(QC_STATE);
+    }); };
+  }});
+}
+
+// Any lead/opportunity that a quotation can be created against — never
+// creates a duplicate lead: this always searches EXISTING Lead Records
+// (spec §3), Pipeline opportunities preferred/sorted first, never filtered
+// down to only "eligible" ones the way Add-to-Pipeline is (a quotation can
+// legitimately be created against a lead at any stage).
+function quotationSearchableLeads(){
+  return DB.all('leads').filter(l=>!l.archived);
+}
+function digitsOnly(s){ return String(s||'').replace(/\D/g,''); }
+function quotationLeadMatches(l, nq){
+  if(!nq) return true;
+  const fields = [l.id, l.clientName, l.businessName, l.interestedService, l.interestedService?serviceDisplayName(l.interestedService):null, l.projectCode].filter(Boolean).map(v=>String(v).toLowerCase());
+  if(fields.some(f=>f.includes(nq))) return true;
+  const qDigits = digitsOnly(nq);
+  return qDigits.length>=3 && digitsOnly(l.phone).includes(qDigits);
+}
+function quotationLeadSuggestions(query){
+  const nq = String(query||'').trim().toLowerCase();
+  let leads = quotationSearchableLeads();
+  if(nq) leads = leads.filter(l=>quotationLeadMatches(l, nq));
+  // Pipeline opportunities preferred/sorted first (spec §3), then the rest,
+  // each group newest-first.
+  leads.sort((a,b)=>{
+    const pa = PIPELINE_STATUSES.includes(a.status) ? 0 : 1;
+    const pb = PIPELINE_STATUSES.includes(b.status) ? 0 : 1;
+    if(pa!==pb) return pa-pb;
+    return new Date(b.createdAt) - new Date(a.createdAt);
+  });
+  return leads.slice(0, 10);
+}
+
+// A brand-new quotation defaults Year 1 Maintenance to Included/Free ($0) —
+// the friendly, common case per the spec's own example ("Free Maintenance —
+// 1 Year, Cost = $0"). Editing an EXISTING quotation instead defaults to
+// 'not_included' (see loadStateFromQuotation) whenever the saved record has
+// no `maintenance` object at all, so opening an old quotation created
+// before this feature existed never silently adds new maintenance wording/
+// terms to it (spec §16: never overwrite old quotation terms).
+function defaultMaintenanceState(){
+  return { year1Mode:'included', year1Cost:0, year2Cost:0, year3Cost:0, year2DisplayMode:'estimated', year3DisplayMode:'estimated' };
+}
+
+/* ---------------------------------------------------------------------- */
+/* Annual Cost Breakdown — the ONE canonical Year 1 / Year 2 / Year 3      */
+/* pricing model (Quotations restructure spec). Replaces the old scattered */
+/* "Domain & Infrastructure" / "Maintenance & Support" / "Year-by-Year     */
+/* Cost" sections with a single consolidated data shape:                   */
+/*                                                                          */
+/*   annualCost = {                                                        */
+/*     year1: { domain, domainMode:'included'|'separate'|'client_own',     */
+/*              hosting, hostingIncluded, maintenance, maintenanceMode },   */
+/*     year2: { domain, hosting, maintenance, displayMode },                */
+/*     year3: { domain, hosting, maintenance, displayMode },                */
+/*   }                                                                      */
+/*                                                                          */
+/* `displayMode`/`maintenanceMode`('included'|'paid'|'not_included') reuse  */
+/* the exact same mode strings `qcYearAmountDisplay()`/the legacy           */
+/* `maintenance` object already used (spec §27) — nothing new to learn.    */
+/*                                                                          */
+/* PERSISTENCE — no DB schema/migration was added for this (spec §28: no   */
+/* migration/backfill scripts). The canonical `annualCost` object is        */
+/* stored as a hidden entry inside the quotation's existing `importantNotes`*/
+/* jsonb array (already a free-form per-quotation snapshot column) under a  */
+/* reserved key that every render path filters out of the visible notes    */
+/* list — see visibleImportantNotes()/ANNUAL_COST_HIDDEN_NOTE_KEYS. A       */
+/* legacy-mirror `maintenance` object (+ domainCost/domainIncluded/         */
+/* domainRenewalEstimate/year2Total/year3Total) is ALSO still written on    */
+/* every save, kept in sync with annualCost, purely so every other existing */
+/* consumer (buildQuoteSections' Year 2/3 math, maintenanceWordingNotes(),  */
+/* the dashboard/list-table Year 1 Total reads, etc.) keeps working         */
+/* completely unchanged — Sales/Founder only ever SEE and edit one set of   */
+/* fields (the new Annual Cost Breakdown section); the mirror is invisible  */
+/* plumbing, not a second editable source of truth.                        */
+/* ---------------------------------------------------------------------- */
+const ANNUAL_COST_HIDDEN_NOTE_KEYS = new Set(['__annualCost','__showDetailedBreakdown']);
+
+function defaultAnnualCostState(svc){
+  const d = defaultAnnualCostForService(svc);
+  return { year1:{...d.year1}, year2:{...d.year2}, year3:{...d.year3} };
+}
+
+// Deep-ish clone + shape-guard so a stored/legacy-derived object can never
+// crash the form on a missing sub-key (older/partial saves, hand-edited
+// fixtures in tests, etc.).
+/* ---------------------------------------------------------------------- */
+/* Per-year Maintenance COST vs NOTE model (generalizes the immediately-    */
+/* preceding task's Year-1-only "maintenanceRemark" mechanism to Year 1 AND */
+/* Year 2 AND Year 3 — this SUBSUMES that mechanism, it does not add a      */
+/* second parallel one). For EACH year:                                    */
+/*                                                                          */
+/*   maintenanceInclude: boolean — the ONLY financial switch. true AND      */
+/*     `maintenance` > 0 means the amount is added into that year's Total   */
+/*     and the year's budget-detail wording appends "& Maintenance". false  */
+/*     means $0 contributed to the total, no matter what `maintenance`      */
+/*     holds, and the wording never appends "& Maintenance".                */
+/*                                                                          */
+/*   maintenanceNote: { enabled, type, period, customText } — purely        */
+/*     informational, fully independent from maintenanceInclude. `type` is */
+/*     one of MAINT_NOTE_TYPES: 'freePeriod' (uses `period`, and            */
+/*     `customText` only when period==='Custom'), 'paidAnnual' (references  */
+/*     `maintenance` as TEXT ONLY — string interpolation, never coupled     */
+/*     back into any total), 'optional' (fixed default sentence), or        */
+/*     'custom' (`customText` used verbatim). When enabled, generates       */
+/*     exactly one Important Note for that year — see                      */
+/*     maintenanceImportantNotes() below — regardless of maintenanceInclude.*/
+/*                                                                          */
+/* BACKWARD COMPATIBILITY (read-time-only, never mutates stored data):      */
+/*   - A record with neither field present (genuinely old, OR carrying the  */
+/*     prior task's year1-only `maintenanceMode`/`maintenanceRemark` shape) */
+/*     is migrated below. Year 1's `maintenanceInclude` derives from the    */
+/*     old `maintenanceMode==='paid'` financial condition when present      */
+/*     (prior-task shape); Year 2/3 (which never had ANY toggle before this */
+/*     task — their dollar amount was always unconditionally summed into    */
+/*     the total) default `maintenanceInclude` to true so an already-saved  */
+/*     prior-task quotation's totals never shift by even a cent.            */
+/*   - A GENUINELY old quotation (derived via annualCostFromLegacy() below, */
+/*     which never had ANY maintenance-note concept at all) explicitly      */
+/*     forces maintenanceInclude:false for every year, overriding the       */
+/*     fallback above — see annualCostFromLegacy(). Its already-printed     */
+/*     document is never affected either way: buildQuoteSections() renders  */
+/*     a genuinely-legacy record from its own untouched flat fields, never  */
+/*     from this derived object (see usingNewModel there).                  */
+/* ---------------------------------------------------------------------- */
+const MAINT_NOTE_PERIODS = ['1 Month','2 Months','3 Months','6 Months','1 Year','Custom'];
+const MAINT_NOTE_PERIOD_TEXT = { '1 Month':'1 month', '2 Months':'2 months', '3 Months':'3 months', '6 Months':'6 months', '1 Year':'1 year' };
+const MAINT_NOTE_TYPES = ['freePeriod','paidAnnual','optional','custom'];
+const MAINT_NOTE_TYPE_LABELS = { freePeriod:'Free Period', paidAnnual:'Paid Annual Maintenance', optional:'Optional Maintenance', custom:'Custom' };
+
+function normalizeMaintenanceInclude(yr){
+  if(typeof (yr && yr.maintenanceInclude) === 'boolean') return yr.maintenanceInclude;
+  // Migration: prior-task Year 1 shape stored a 'included'|'paid'|'not_included'
+  // string — its exact financial equivalent is mode==='paid'.
+  if(yr && typeof yr.maintenanceMode === 'string') return yr.maintenanceMode === 'paid';
+  // Year 2/3 never had a toggle at all before this task — their amount was
+  // always unconditionally summed, so the equivalent is "always included".
+  return true;
+}
+// Finds whatever note-shaped input exists on a year object, new or old —
+// never mutates, purely picks a source for normalizeMaintenanceNote() below.
+function resolveMaintenanceNoteInput(yr){
+  if(!yr) return null;
+  if(yr.maintenanceNote) return yr.maintenanceNote;
+  // Migration: prior-task Year 1 shape's `maintenanceRemark` was always a
+  // Free-Period-style note (it had no `type`/other note kinds yet).
+  if(yr.maintenanceRemark) return { enabled: !!yr.maintenanceRemark.enabled, type:'freePeriod', period: yr.maintenanceRemark.period, customText: yr.maintenanceRemark.customText };
+  return null;
+}
+function normalizeMaintenanceNote(input){
+  const type = MAINT_NOTE_TYPES.includes(input && input.type) ? input.type : 'freePeriod';
+  const period = (input && MAINT_NOTE_PERIODS.includes(input.period)) ? input.period : '1 Month';
+  return {
+    enabled: !!(input && input.enabled),
+    type, period,
+    customText: (input && typeof input.customText==='string') ? input.customText : '',
+  };
+}
+function normalizeAnnualCostYear(yr, extra){
+  return {
+    maintenance: Number(yr.maintenance)||0,
+    maintenanceInclude: normalizeMaintenanceInclude(yr),
+    maintenanceNote: normalizeMaintenanceNote(resolveMaintenanceNoteInput(yr)),
+    ...extra,
+  };
+}
+function normalizeAnnualCost(ac){
+  const y1 = (ac && ac.year1) || {};
+  const y2 = (ac && ac.year2) || {};
+  const y3 = (ac && ac.year3) || {};
+  return {
+    year1: { domain:Number(y1.domain)||0, domainMode: y1.domainMode||'included',
+             hosting:Number(y1.hosting)||0, hostingIncluded: y1.hostingIncluded!==false,
+             ...normalizeAnnualCostYear(y1) },
+    year2: normalizeAnnualCostYear(y2, { domain:Number(y2.domain)||0, hosting:Number(y2.hosting)||0, displayMode: y2.displayMode||'estimated' }),
+    year3: normalizeAnnualCostYear(y3, { domain:Number(y3.domain)||0, hosting:Number(y3.hosting)||0, displayMode: y3.displayMode||'estimated' }),
+  };
+}
+
+function extractAnnualCost(importantNotes){
+  const note = (importantNotes||[]).find(n=>n.key==='__annualCost');
+  if(!note) return null;
+  try{ const parsed = JSON.parse(note.text); return normalizeAnnualCost(parsed); }catch(e){ return null; }
+}
+function extractShowDetailedBreakdown(importantNotes){
+  const note = (importantNotes||[]).find(n=>n.key==='__showDetailedBreakdown');
+  return !!(note && note.text==='1');
+}
+// The two hidden bookkeeping notes appended at save time (see saveQuotationFromState).
+function annualCostHiddenNotes(annualCost, showDetailedBreakdown){
+  return [
+    { key:'__annualCost', title:'', text: JSON.stringify(annualCost) },
+    { key:'__showDetailedBreakdown', title:'', text: showDetailedBreakdown ? '1' : '0' },
+  ];
+}
+// Every place that renders `importantNotes` to a human (Create form's H.
+// section, the printed document's Important Notes list) must go through
+// this — never iterate importantNotes directly — so the hidden Annual Cost
+// payload is never accidentally printed as a note.
+function visibleImportantNotes(importantNotes){
+  return (importantNotes||[]).filter(n=> !ANNUAL_COST_HIDDEN_NOTE_KEYS.has(n.key));
+}
+
+// READ-TIME-ONLY legacy migration (spec §28): a quotation saved before this
+// feature existed carries none of the hidden notes above — this derives an
+// equivalent annualCost shape from its old flat fields
+// (domainCost/domainIncluded/domainRenewalEstimate/year2Total/year3Total/
+// maintenance), following the exact same precedent as the pre-existing
+// `maintenance: q.maintenance || {defaults}` fallback. NEVER writes back to
+// the record — purely a display/edit-form convenience so an old quotation
+// can be opened in the new Annual Cost Breakdown editor without silently
+// losing or renumbering anything it already had.
+function annualCostFromLegacy(q){
+  const maint = q.maintenance || { year1Mode:'not_included', year1Cost:0, year2Cost:0, year3Cost:0, year2DisplayMode:'estimated', year3DisplayMode:'estimated' };
+  return normalizeAnnualCost({
+    year1: {
+      domain: Number(q.domainCost)||0,
+      domainMode: q.domainCost==null ? 'included' : (q.domainIncluded===false ? 'separate' : 'included'),
+      hosting: 0, hostingIncluded: true, // legacy quotations never separated hosting out of the base package price
+      maintenance: Number(maint.year1Cost)||0,
+      // Genuinely-old quotation (no maintenance-note concept ever existed):
+      // the ENTIRE new model defaults OFF/OFF for every year (spec) — this
+      // literal boolean wins over normalizeMaintenanceInclude()'s generic
+      // fallback, which would otherwise assume "always included" the way it
+      // does for a prior-task record. Never affects the already-printed
+      // document either way (see buildQuoteSections' usingNewModel branch).
+      maintenanceInclude: false,
+    },
+    // Legacy year2Total/year3Total were already a single combined
+    // domain+hosting renewal figure — kept whole in `hosting` here (domain
+    // left at 0) so re-deriving never double-counts or shifts what a
+    // previously-printed document already showed.
+    year2: { domain:0, hosting: Number(q.year2Total)||0, maintenance: Number(maint.year2Cost)||0, maintenanceInclude:false, displayMode: maint.year2DisplayMode||'estimated' },
+    year3: { domain:0, hosting: Number(q.year3Total)||0, maintenance: Number(maint.year3Cost)||0, maintenanceInclude:false, displayMode: maint.year3DisplayMode||'estimated' },
+  });
+}
+// The single entry point the Edit-modal loader uses: prefer the new stored
+// model, fall back to deriving one from legacy fields. Never used by
+// buildQuoteSections (which needs to tell the two cases apart — see its own
+// `extractAnnualCost(q.importantNotes)` call — so an already-printed legacy
+// document's numbers never shift).
+function resolvedAnnualCost(q){
+  return extractAnnualCost(q.importantNotes) || annualCostFromLegacy(q);
+}
+
+// Year 1 TOTAL formula (spec §10): Development + scope add-ons + discount/
+// adjustment are already exactly what evaluateQuotation()'s `finalPrice`
+// computes over the package's base item + scope items — this only adds the
+// three NEW Year-1 chargeable components on top. Domain: charged only when
+// "Charged Separately" (Included/Client-Own both mean $0 added — the cost,
+// if any, is either already inside the base package price or genuinely
+// zero for an existing/client-owned domain). Hosting: charged only when NOT
+// bundled/included. Maintenance: charged only when NOT Included/Free.
+// Maintenance's dollar contribution to a year's total is driven EXCLUSIVELY
+// by `maintenanceInclude` being true AND `maintenance` > 0 — completely
+// decoupled from `maintenanceNote` (its toggle, type, or text content, no
+// matter what numbers that text happens to mention). The single choke point
+// every Year 1/2/3 total (and the "& Maintenance" wording decision in
+// buildQuoteSections) must go through.
+function qcAnnualYearMaintenanceCharge(yr){
+  return yr.maintenanceInclude ? (Number(yr.maintenance)||0) : 0;
+}
+function qcAnnualYear1Charge(y1){
+  const domain = y1.domainMode==='separate' ? (Number(y1.domain)||0) : 0;
+  const hosting = y1.hostingIncluded ? 0 : (Number(y1.hosting)||0);
+  return domain + hosting + qcAnnualYearMaintenanceCharge(y1);
+}
+// Year 2/3 TOTAL formula (spec §10): Domain + Hosting/Backend/Database +
+// Maintenance (only when maintenanceInclude is on) — Development is NEVER
+// included again after Year 1.
+function qcAnnualYearTotal(yr){
+  return (Number(yr.domain)||0) + (Number(yr.hosting)||0) + qcAnnualYearMaintenanceCharge(yr);
+}
+
+// The ONE place that turns live Create/Edit form state into every derived
+// number the rest of the form/preview/save path needs — called by
+// renderCreateQuotationModal, refreshQcPreview AND saveQuotationFromState
+// so all three can never drift out of sync with each other (spec §29: "no
+// stale totals").
+function qcComputeQuoteTotals(s){
+  const svc = serviceByProjectType(s.packageKey);
+  const activeItems = s.items.filter(i=>i.included!==false).map(i=>({name:i.name, price:i.price, priceType:i.priceType}));
+  const evalRes = evaluateQuotation({
+    items: activeItems, basePackage: svc, discountPct: Number(s.discountPct)||0,
+    manualAdjustment: s.adjustment ? { amount:Number(s.adjustment), reason:s.adjustmentReason } : null,
+    discountLimitPct: effectiveDiscountLimit(svc),
+  });
+  const annualCost = normalizeAnnualCost(s.annualCost);
+  const year1Charge = qcAnnualYear1Charge(annualCost.year1);
+  const year1Total = evalRes.priceIsTBC ? null : Math.round((evalRes.finalPrice + year1Charge)*100)/100;
+  const year2Total = qcAnnualYearTotal(annualCost.year2);
+  const year3Total = qcAnnualYearTotal(annualCost.year3);
+  const schedule = computePaymentSchedule(evalRes.priceIsTBC?0:year1Total, s.paymentPreset, s.customStages);
+  return { svc, evalRes, annualCost, year1Development: svc?svc.basePrice:0, year1Charge, year1Total, year2Total, year3Total, schedule };
+}
+
+// The Year-1 PAYMENT SCHEDULE total, additive-only: the stored/displayed
+// scope total (year1ScopeTotal) is never mutated by maintenance — this is
+// computed only at the specific points that need a maintenance-inclusive
+// number (the payment-schedule split, and the printed Year 1 Amount cell),
+// keeping `year1Total` itself pure scope/hosting everywhere else (dashboard
+// KPIs, lead.quotationAmount, the quotations list-table Amount column).
+function qcYear1PaymentTotal(maintenance, year1ScopeTotal){
+  const m = maintenance || {};
+  const scope = Number(year1ScopeTotal) || 0;
+  const addOn = (m.year1Mode==='paid') ? (Number(m.year1Cost)||0) : 0;
+  return scope + addOn;
+}
+
+// Formats a Year 2/3 renewal amount per its display mode (spec §3) — never
+// forces a single fixed renewal total onto every quotation.
+function qcYearAmountDisplay(amount, mode){
+  if(mode==='tbc') return 'To be confirmed';
+  const amt = Number(amount)||0;
+  if(mode==='exact') return moneyPrecise(amt)+'/year';
+  return '~'+moneyEstimate(amt)+'/year'; // 'estimated' (default) — spec: don't force .00 on approximate labels
+}
+
+// The Maintenance Renewal wording note (spec §14) — regenerated fresh from
+// the live maintenance state every time (never stored as static text), and
+// only added when Year 1 maintenance was actually mentioned on this
+// quotation at all. NOTE: this used to also generate a "Year 1 Maintenance"
+// note here (auto-injected purely from the cost/Included-Free toggle) — that
+// note has been REMOVED. The old text ("Basic maintenance and support
+// included for Year 1.") wrongly implied a full year of free coverage, and
+// is now fully replaced by the independent, explicit per-year Maintenance
+// Note control (see maintenanceImportantNotes() below) — the cost/Include
+// toggle itself never auto-injects any Important Note any more.
+function maintenanceWordingNotes(maintenance){
+  const m = maintenance;
+  if(!m || m.year1Mode==='not_included') return [];
+  return [
+    { key:'maintenanceRenewal', title:'Maintenance Renewal', text:'Annual maintenance and support is billed separately from Year 2 onward at the quoted/confirmed annual rate. Standard maintenance covers minor bug fixes, basic CMS/admin guidance, and small support within the existing scope — it does not include new features, major redesign, new integrations, or major workflow changes.' },
+  ];
+}
+
+// Maintenance NOTE (informational, zero price impact) — the exact resulting
+// sentence shown both in the live form preview and (prefixed with
+// "Year N Maintenance: " via the standard title+text note renderer) in the
+// printed Important Notes list. `amount` is the year's raw Maintenance &
+// Support ($) figure, used ONLY as text interpolation for the 'paidAnnual'
+// wording — this is never read back into any total (see
+// qcAnnualYearMaintenanceCharge, the sole financial choke point, which never
+// calls this function). Custom wording (type 'custom', or type 'freePeriod'
+// with period 'Custom') is used VERBATIM — never wrapped in a template.
+function maintenanceNoteSentence(note, amount){
+  if(!note) return '';
+  switch(note.type){
+    case 'paidAnnual':
+      return `Annual maintenance and support is available at $${Number(amount)||0}/year.`;
+    case 'optional':
+      return 'Maintenance and support is optional and can be renewed separately based on client requirements.';
+    case 'custom':
+      return String(note.customText||'').trim();
+    case 'freePeriod':
+    default: {
+      if(note.period==='Custom') return String(note.customText||'').trim();
+      const periodText = MAINT_NOTE_PERIOD_TEXT[note.period] || '1 month';
+      return `${periodText} basic maintenance and support is included at no additional cost.`;
+    }
+  }
+}
+// The ONLY source of any maintenance-related Important Note (subsumes the
+// prior task's year1MaintenanceRemarkNotes()): iterates Year 1, then Year 2,
+// then Year 3 (ordering preserved), emitting exactly one note per year where
+// that year's note is enabled and produces non-empty wording (guards against
+// an empty Custom text producing a blank note). Years with the note toggle
+// OFF contribute nothing. Never touches any year's Total/Subtotal/Payment
+// Schedule — purely text, regardless of maintenanceInclude or of what dollar
+// figures the resulting text itself happens to mention.
+function maintenanceImportantNotes(annualCost){
+  const notes = [];
+  if(!annualCost) return notes;
+  [1,2,3].forEach(n=>{
+    const yr = annualCost['year'+n];
+    if(!yr || !yr.maintenanceNote || !yr.maintenanceNote.enabled) return;
+    const text = maintenanceNoteSentence(yr.maintenanceNote, yr.maintenance);
+    if(!text) return;
+    notes.push({ key:'maintenanceNoteYear'+n, title:`Year ${n} Maintenance`, text });
+  });
+  return notes;
+}
+
+// Non-destructive display filter for spec §15: hides a standard exclusion
+// from the PRINTED/displayed list when a currently-active scope item's name
+// clearly overlaps with it (e.g. "Online Payment" added to scope hides
+// "Online payment gateway" from Not Included) — the underlying stored
+// `exclusions` array is never mutated, so toggling the scope item back off
+// instantly restores the exclusion with zero data-loss risk.
+const EXCLUSION_FILTER_STOPWORDS = new Set(['the','and','for','with','from','this','that','system','management','support','service','services']);
+function significantWords(text){
+  return String(text||'').toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(w=>w.length>=5 && !EXCLUSION_FILTER_STOPWORDS.has(w));
+}
+function activeScopeMentionsExclusion(items, exclusionText){
+  const exWords = significantWords(exclusionText);
+  if(!exWords.length) return false;
+  const scopeWords = new Set();
+  (items||[]).forEach(it=> significantWords(it.name).forEach(w=>scopeWords.add(w)));
+  return exWords.some(w=>scopeWords.has(w));
+}
+function visibleExclusions(items, exclusions){
+  return (exclusions||[]).filter(x=>!activeScopeMentionsExclusion(items, x));
+}
+
+function openCreateQuotationModal(prefill={}){
+  let base = null;
+  if(prefill.duplicateFrom){
+    const src = DB.find('quotations', prefill.duplicateFrom);
+    if(src) base = loadStateFromQuotation(src, { asDuplicate:true });
+  }
+  QC_STATE = base || {
+    sourceType: prefill.sourceType || 'lead', // lead | new
+    leadId: prefill.leadId || null,
+    clientName:'', businessName:'', phone:'', telegram:'', industry:'', interestedService:'',
+    assignedSales: CURRENT_USER.name,
+    packageKey:'', discountPct:0, adjustment:0, adjustmentReason:'',
+    items: [], exclusions: [], notesOverride: null, clientNote:'',
+    domainName:'',
+    // Annual Cost Breakdown (spec §D) — the ONE editable source of Year 1/2/3
+    // pricing; `maintenance` below is kept only as an internal legacy mirror
+    // (see the big comment above defaultAnnualCostState) never shown as its
+    // own form section any more.
+    annualCost: defaultAnnualCostState(null),
+    showDetailedBreakdown: false,
+    maintenance: defaultMaintenanceState(),
+    paymentPreset: '30/70', customStages:null,
+    quotationDate: todayLocalISO(), validUntil: daysFromNow(quotationDefaults().validityDays),
+    demoLink:'', demoLinks: [], editingId: null, versionOf: null,
+  };
+  if(QC_STATE.leadId) applyLeadToQC(QC_STATE.leadId);
+  QC_TAB = 'edit';
+  QC_ZOOM = 'fit';
+  // Arm the unsaved-changes baseline AFTER the starting state above
+  // (including applyLeadToQC's prefill) is fully settled, and BEFORE the
+  // first render — so opening this modal, alone, is never itself "dirty".
+  qcArmDirtyTracking();
+  renderCreateQuotationModal();
+}
+
+function applyLeadToQC(leadId){
+  const lead = DB.find('leads', leadId);
+  if(!lead) return;
+  Object.assign(QC_STATE, {
+    leadId: lead.id, sourceType:'lead', projectCode: lead.projectCode || null,
+    clientName: lead.clientName, businessName: lead.businessName, phone: lead.phone,
+    telegram: lead.telegram||'', industry: lead.industry, interestedService: lead.interestedService||'',
+    assignedSales: canChooseAssignedSales(CURRENT_USER.role) ? lead.assignedSales : CURRENT_USER.name,
+  });
+  if(!QC_STATE.packageKey && lead.interestedService){
+    const svc = serviceByProjectType(lead.interestedService);
+    if(svc) selectPackageOnQC(svc.projectType);
+  }
+}
+
+function selectPackageOnQC(projectType){
+  const svc = serviceByProjectType(projectType);
+  QC_STATE.packageKey = projectType;
+  QC_STATE.quotationType = svc ? quotationTypeForProjectType(svc.projectType) : 'website';
+  // Package selection also drives the Annual Cost Breakdown's default
+  // numbers (spec §16: "Package selection controls ... default yearly
+  // costs") — same reset-on-package-change convention already used for
+  // items/exclusions below, so switching packages never leaves stale
+  // numbers from a different package's pricing shape behind.
+  QC_STATE.annualCost = defaultAnnualCostState(svc);
+  if(!svc){ QC_STATE.items = []; QC_STATE.exclusions = []; return; }
+  const baseItem = { id: fnId(), module: svc.category, name: `${svc.shortName || svc.name} (Base Package${svc.priceIsStartingFrom?' — starting from':''})`,
+    price: svc.basePrice, priceType:'included', editableOnQuotation:false, included: true };
+  // Root-cause fix (BizWeb CRM -- Replace Founder Review with Configurable
+  // Package Add-On Pricing): each function now keeps its OWN priceType
+  // instead of a founder-review flag -- 'included' functions are bundled
+  // at $0, 'fixed' functions start at their configured default amount,
+  // 'manual' functions start at null (shown as TBC until Sales enters the
+  // agreed figure) -- and starts selected/unselected per the package's own
+  // `defaultSelected`, not forced on for every function.
+  const fnItems = svc.functions.map(f=>({ id:fnId(), module: svc.category, name:f.name,
+    price: f.priceType==='included' ? 0 : f.defaultPrice,
+    priceType: f.priceType, editableOnQuotation: f.editableOnQuotation,
+    included: f.defaultSelected }));
+  QC_STATE.items = [baseItem, ...fnItems];
+  // Package-specific exclusions (APPROVED FINAL, 2026-09-13, Section E) take
+  // priority over the generic per-type template — see PACKAGE_SPECIFIC_
+  // EXCLUSIONS in data.js. A projectType with no specific entry (e.g.
+  // 'Other', or any future package not yet added there) falls back to the
+  // existing Settings-editable generic website/system template exactly as
+  // before, so that Settings screen and its data shape are unaffected.
+  const pkgExclusions = PACKAGE_SPECIFIC_EXCLUSIONS[projectType];
+  QC_STATE.exclusions = [...(pkgExclusions !== undefined ? pkgExclusions : (quotationDefaults().exclusions[QC_STATE.quotationType]||[]))];
+}
+
+function qcQuoteNumberPreview(){
+  // The quotation number (BW-Q-{code}-{date}[-R#]) is allocated by the server when the quotation is saved; the browser never guesses it.
+  const editing = QC_STATE && QC_STATE.editingId ? DB.find('quotations', QC_STATE.editingId) : null;
+  return editing && editing.quoteNumber ? editing.quoteNumber : 'Number assigned when saved';
+}
+
+function renderCreateQuotationModal(){
+  // A handful of edits still require a full remount (package change, item
+  // include/remove, Add Scope Item, discount/adjustment, payment preset,
+  // quotation date) rather than the lighter refreshQcPreview path. A full
+  // remount would otherwise always jump the left panel back to its top
+  // (spec §12) — captured here and restored after the new DOM mounts so
+  // the user's place in a long form is never lost.
+  const prevOverlay = document.getElementById('activeModalOverlay');
+  const prevScrollTop = prevOverlay ? (prevOverlay.querySelector('.qc-edit-col')||{}).scrollTop : null;
+
+  const s = QC_STATE;
+  const svc = serviceByProjectType(s.packageKey);
+  const activeItems = s.items.filter(i=>i.included!==false).map(i=>({name:i.name, price:i.price, priceType:i.priceType}));
+  const evalRes = evaluateQuotation({
+    items: activeItems, basePackage: svc, discountPct: Number(s.discountPct)||0,
+    manualAdjustment: s.adjustment ? { amount:Number(s.adjustment), reason:s.adjustmentReason } : null,
+    discountLimitPct: effectiveDiscountLimit(svc),
+  });
+  const totals = qcComputeQuoteTotals(s);
+  const schedule = totals.schedule;
+  const qd = quotationDefaults();
+
+  const html = `
+    <div class="modal-head">
+      <h3>${s.editingId?'Edit Quotation':'Create Quotation'}</h3>
+      <div class="qc-tabs">
+        <div class="tab-btn ${QC_TAB==='edit'?'active':''}" data-qctab="edit">Edit</div>
+        <div class="tab-btn ${QC_TAB==='preview'?'active':''}" data-qctab="preview">Preview</div>
+      </div>
+      <button class="modal-close" id="cqClose">&times;</button>
+    </div>
+    <div class="modal-body qc-modal-body">
+      <div class="qc-split">
+        <div class="qc-edit-col" ${QC_TAB!=='edit'?'data-hide-narrow="1"':''}>
+
+          <div class="form-field" style="margin-bottom:12px">
+            <label>Source</label>
+            <div class="flex-row" style="gap:8px;flex-wrap:wrap">
+              <button class="btn btn-sm ${s.sourceType==='lead'?'btn-primary':'btn-outline'}" data-src="lead">Existing Lead / Opportunity</button>
+              <button class="btn btn-sm ${s.sourceType==='new'?'btn-primary':'btn-outline'}" data-src="new">New / Direct Client</button>
+            </div>
+          </div>
+
+          ${s.sourceType==='lead' ? `
+          <div class="form-field full" style="margin-bottom:12px">
+            <label class="required">Select Lead</label>
+            <div class="search-box" id="qcSearchBox" style="max-width:100%">
+              ${icon('search')}
+              <input type="text" id="qcSearch" placeholder="Search by Lead ID, Client Name, Business Name, Phone, or Project Code…" autocomplete="off">
+            </div>
+            <div id="qcResults" class="atp-dropdown" style="display:none"></div>
+            ${s.leadId ? `<div class="text-muted" style="font-size:12px;margin-top:6px">Linked: ${escapeHtml(s.leadId)} — ${escapeHtml(s.clientName)} — ${escapeHtml(s.businessName)}</div>` : ''}
+          </div>` : ''}
+
+          <div class="section-title" style="font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px">A. Client Information</div>
+          <div class="form-grid">
+            <div class="form-field"><label class="required">Client Name</label><input id="cq_clientName" value="${escapeHtml(s.clientName)}" ${s.sourceType!=='new'?'readonly class="field-locked"':''}></div>
+            <div class="form-field"><label>Business Name <span class="text-muted" style="font-weight:400">(optional)</span></label><input id="cq_businessName" value="${escapeHtml(s.businessName)}" placeholder="Leave blank if the client has no business/trade name" ${s.sourceType!=='new'?'readonly class="field-locked"':''}></div>
+            <div class="form-field"><label>Phone</label><input id="cq_phone" value="${escapeHtml(s.phone)}" ${s.sourceType!=='new'?'readonly class="field-locked"':''}></div>
+            <div class="form-field"><label>Telegram</label><input id="cq_telegram" value="${escapeHtml(s.telegram)}"></div>
+            <div class="form-field"><label class="required">Industry</label>
+              <select id="cq_industry" class="sel" ${s.sourceType!=='new'?'disabled':''}>${INDUSTRIES.map(i=>`<option ${s.industry===i?'selected':''}>${i}</option>`).join('')}</select>
+            </div>
+            <div class="form-field"><label class="required">Assigned Sales</label>
+              ${canChooseAssignedSales(CURRENT_USER.role)
+                ? `<select id="cq_sales" class="sel">${salesOwnersList().map(n=>`<option ${s.assignedSales===n?'selected':''}>${n}</option>`).join('')}</select>`
+                : `<input value="${escapeHtml(s.assignedSales)}" readonly class="field-locked">`}
+            </div>
+          </div>
+
+          <div class="divider"></div>
+          <div class="section-title" style="font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px">B. Project Information</div>
+          <div class="form-grid">
+            <div class="form-field full">
+              <label class="required">Package (from Service Price List)</label>
+              <select id="cq_package" class="sel" style="width:100%">
+                <option value="">Select a package…</option>
+                ${(DB.all('services').length?DB.all('services'):SERVICE_PRICE_LIST).map(p=>`<option value="${p.projectType}" ${s.packageKey===p.projectType?'selected':''}>${p.name} — ${p.priceIsStartingFrom?'from ':''}$${p.basePrice}</option>`).join('')}
+              </select>
+            </div>
+            <div class="form-field"><label>Project Code <span class="field-auto-badge">Auto</span></label><input value="${escapeHtml(s.projectCode||'Assigned when quotation is sent to a Pipeline project')}" readonly></div>
+            <div class="form-field"><label>Quote No. (preview) <span class="field-auto-badge">Auto</span></label><input value="${s.packageKey?qcQuoteNumberPreview():'—'}" readonly></div>
+            <div class="form-field"><label class="required">Quotation Date</label><input type="date" id="cq_qdate" value="${s.quotationDate}" ${isFounder()?'':'readonly class="field-locked"'}></div>
+            <div class="form-field"><label class="required">Valid Until</label><input type="date" id="cq_validUntil" value="${s.validUntil}" ${isFounder()?'':'readonly class="field-locked"'}></div>
+            <div class="form-field full">
+              <label>Demo Link</label>
+              <input id="cq_demoLink" value="${escapeHtml(s.demoLink)}" placeholder="https://...">
+              ${(s.demoLinks||[]).map((link,idx)=>`
+                <div class="flex-row" style="gap:8px;align-items:center;margin-top:8px">
+                  <span class="text-muted" style="font-size:11px;min-width:82px;flex-shrink:0">Demo Link ${idx+2}</span>
+                  <input data-demolink-extra="${idx}" value="${escapeHtml(link)}" placeholder="https://..." style="flex:1">
+                  <span class="icon-btn" data-remove-demolink="${idx}" title="Remove Demo Link ${idx+2}" style="font-size:15px;cursor:pointer">&times;</span>
+                </div>`).join('')}
+              ${(s.demoLinks||[]).length < 2
+                ? `<button class="btn btn-outline btn-sm" id="cq_addDemoLink" type="button" style="margin-top:8px">+ Add Demo Link</button>`
+                : ''}
+            </div>
+          </div>
+
+          <div class="divider"></div>
+          <div class="section-title" style="font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px">C. Scope of Work / Functions</div>
+          <div id="cq_itemsWrap">${quotationItemsEditorHtml(s.items)}</div>
+          <button class="btn btn-outline btn-sm" id="cq_addFn" style="margin:8px 0 16px">+ Add Scope Item</button>
+          <div class="text-muted" style="font-size:12px;margin:-8px 0 14px">Standard exclusions for this package (Founder/Admin-editable in Settings → Quotations):</div>
+          <ul style="margin:-8px 0 16px;padding-left:18px;font-size:12.5px;color:var(--muted)">${visibleExclusions(s.items.filter(i=>i.included!==false), s.exclusions).map(x=>`<li>${escapeHtml(x)}</li>`).join('')}</ul>
+
+          <div class="divider"></div>
+          <div class="section-title" style="font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px">D. Annual Cost Breakdown</div>
+          <div class="form-field" style="margin-bottom:10px"><label>Domain Name</label><input id="cq_domainName" value="${escapeHtml(s.domainName)}" placeholder="e.g. example.com"></div>
+          ${annualCostBreakdownHtml(s, totals.svc, totals)}
+
+          <div class="divider"></div>
+          <div class="section-title" style="font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px">E. Payment Schedule</div>
+          <div class="form-field" style="margin-bottom:12px">
+            <label>Preset</label>
+            <select id="cq_paymentPreset" class="sel">
+              ${['30/70','30/30/40','20/40/40','50/50','Custom'].map(p=>`<option value="${p}" ${s.paymentPreset===p?'selected':''}>${p}</option>`).join('')}
+            </select>
+          </div>
+          <div class="table-wrap scroll-x">
+            <table class="data-table qc-mini-table"><thead><tr><th>Stage</th><th>%</th><th>Amount</th></tr></thead>
+            <tbody>${schedule.map(st=>`<tr><td>${escapeHtml(st.label)}</td><td>${st.pct}%</td><td>${moneyPrecise(st.amount)}</td></tr>`).join('')}</tbody></table>
+          </div>
+          <p class="text-muted" style="font-size:11.5px;margin:6px 0 16px">Stages always sum exactly to the Year 1 Total (${totals.evalRes.priceIsTBC?'TBC':moneyPrecise(totals.year1Total)}) and auto-update whenever any Year 1 cost above changes.</p>
+
+          <div class="divider"></div>
+          <div class="section-title" style="font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px">F. Notes</div>
+          <div class="mini-row"><div class="mini-main"><div class="mini-title">Standard Notes Applied ✓</div><div class="mini-sub">${(s.packageKey?(quotationDefaults().notes[quotationTypeForProjectType(s.packageKey)]||[]).length:0)} standard note(s) for this quotation type will print automatically — managed in Settings → Quotations.</div></div></div>
+          <div class="form-field" style="margin:10px 0 16px"><label>Client-Specific Note (optional)</label><textarea id="cq_clientNote" placeholder="Anything specific to this client — never overrides the standard notes above.">${escapeHtml(s.clientNote)}</textarea></div>
+
+          <div class="divider"></div>
+          <div class="qc-collapsible-head ${s._showAdjustments?'open':''}" id="cq_toggleAdjustments">
+            <span class="car">▸</span> Founder/Admin Pricing Adjustment
+          </div>
+          ${isFounder() ? `
+          <div id="cq_adjustmentsBody" ${s._showAdjustments?'':'hidden'} style="margin-top:10px">
+            <div class="form-grid">
+              <div class="form-field"><label>Discount %</label><input type="number" id="cq_discount" value="${s.discountPct}" min="0" max="100"></div>
+              <div class="form-field"><label>Manual Price Adjustment ($)</label><input type="number" step="0.01" id="cq_adjust" value="${s.adjustment}"></div>
+              <div class="form-field full"><label>Reason for Price Adjustment ${s.adjustment?'<span class="required"></span>':'(required if adjusting)'}</label><input id="cq_adjustReason" value="${escapeHtml(s.adjustmentReason)}" placeholder='e.g. "Client already has hosting."'></div>
+            </div>
+          </div>` : `<div id="cq_adjustmentsBody" ${s._showAdjustments?'':'hidden'} style="margin-top:10px"><input value="Discount 0% — not permitted for your role" readonly class="field-locked"></div>`}
+
+          <div id="cq_authorityBanner">${pricingNotesHtml({...totals.evalRes, finalPrice: totals.year1Total})}</div>
+        </div>
+
+        <div class="qc-preview-col" ${QC_TAB!=='preview'?'data-hide-narrow="1"':''}>
+          <div class="qc-preview-toolbar">
+            <span class="text-muted" style="font-size:11.5px;font-weight:700;text-transform:uppercase;letter-spacing:.4px">Quotation Preview</span>
+            <div class="qc-zoom-controls">
+              <button class="btn btn-ghost btn-sm ${QC_ZOOM==='fit'?'active':''}" data-zoom="fit" title="Fit to panel width">Fit</button>
+              <button class="btn btn-ghost btn-sm ${QC_ZOOM===1?'active':''}" data-zoom="100" title="Actual size">100%</button>
+              <button class="btn btn-ghost btn-sm" data-zoom="out" title="Zoom out">&minus;</button>
+              <button class="btn btn-ghost btn-sm" data-zoom="in" title="Zoom in">+</button>
+            </div>
+          </div>
+          <div class="qc-preview-canvas" id="qcPreviewCanvas">
+            <div class="qc-a4-scale" id="qcA4Scale">
+              <div id="cq_livePreview"><div class="quote-doc-loading">Rendering preview…</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-secondary" id="cqCancel">Cancel</button>
+      <button class="btn btn-primary" id="cqSave">${s.editingId?'Save Revision':'Save as Draft'}</button>
+    </div>
+  `;
+
+  openModal(html, { xl:true, onMount:(overlay)=>{
+    // Re-armed on EVERY render (this modal fully remounts on most field
+    // changes) rather than only once on open — openModal()'s own
+    // closeModal() call at the top of every remount clears whatever guard
+    // was previously registered (see the comment on closeModal() in
+    // app.js), so it must be re-registered here, synchronously, before
+    // control returns to whatever triggered the remount. Cheap and
+    // idempotent either way.
+    setModalCloseGuard(quotationModalCloseGuard);
+    qcSetBeforeUnloadGuard(qcIsDirty());
+    const editCol = overlay.querySelector('.qc-edit-col');
+    if(editCol && prevScrollTop!=null) editCol.scrollTop = prevScrollTop;
+    overlay.querySelector('#cqClose').onclick = requestCloseModal;
+    overlay.querySelector('#cqCancel').onclick = requestCloseModal;
+    overlay.querySelectorAll('[data-qctab]').forEach(t=> t.onclick = ()=>{ QC_TAB = t.dataset.qctab; renderCreateQuotationModal(); });
+    overlay.querySelectorAll('[data-zoom]').forEach(b=> b.onclick = ()=>{
+      const z = b.dataset.zoom;
+      if(z==='fit') QC_ZOOM = 'fit';
+      else if(z==='100') QC_ZOOM = 1;
+      else if(z==='in') QC_ZOOM = Math.min(2, (QC_ZOOM==='fit'?qcCurrentFitZoom(overlay):QC_ZOOM) + 0.1);
+      else if(z==='out') QC_ZOOM = Math.max(0.3, (QC_ZOOM==='fit'?qcCurrentFitZoom(overlay):QC_ZOOM) - 0.1);
+      renderCreateQuotationModal();
+    });
+    qcApplyZoom(overlay);
+    qcWireResize(overlay);
+    const livePreviewEl = overlay.querySelector('#cq_livePreview');
+    if(livePreviewEl) paintQuotePreview(livePreviewEl, qcStateToPreviewQuotation(s, evalRes, schedule), ()=>qcApplyZoom(overlay));
+
+    overlay.querySelectorAll('[data-src]').forEach(b=> b.onclick = ()=>{
+      s.sourceType = b.dataset.src;
+      if(s.sourceType==='new'){ s.leadId=null; s.projectCode=null; }
+      renderCreateQuotationModal();
+    });
+
+    const searchInput = overlay.querySelector('#qcSearch');
+    if(searchInput){
+      const resultsEl = overlay.querySelector('#qcResults');
+      const renderResults = ()=>{
+        const matches = quotationLeadSuggestions(searchInput.value);
+        resultsEl.style.display = 'block';
+        resultsEl.innerHTML = matches.length ? matches.map(l=>`
+          <div class="atp-row" data-pick="${l.id}">
+            <div class="mini-main"><div class="mini-title">${escapeHtml(l.id)} — ${escapeHtml(l.clientName)}</div><div class="mini-sub">${escapeHtml(l.businessName)} · ${escapeHtml(pipelineStageLabel(l.status))}</div></div>
+            <span class="atp-pill ${PIPELINE_STATUSES.includes(l.status)?'atp-pill-select':'atp-pill-notqualified'}">${PIPELINE_STATUSES.includes(l.status)?'Pipeline':escapeHtml(pipelineStageLabel(l.status))}</span>
+          </div>`).join('') : `<div class="empty-row">No matching Lead Record found.</div>`;
+        resultsEl.querySelectorAll('[data-pick]').forEach(r=> r.onclick = ()=>{
+          applyLeadToQC(r.dataset.pick);
+          renderCreateQuotationModal();
+        });
+      };
+      searchInput.oninput = renderResults;
+      searchInput.onfocus = renderResults;
+    }
+
+    const cn = overlay.querySelector('#cq_clientName'); if(cn) cn.oninput = e=>{ s.clientName = e.target.value; refreshQcPreview(overlay); };
+    const bn = overlay.querySelector('#cq_businessName'); if(bn) bn.oninput = e=>{ s.businessName = e.target.value; refreshQcPreview(overlay); };
+    const ph = overlay.querySelector('#cq_phone'); if(ph) ph.oninput = e=> s.phone = e.target.value;
+    overlay.querySelector('#cq_telegram').oninput = e=> s.telegram = e.target.value;
+    const industrySel = overlay.querySelector('#cq_industry');
+    if(industrySel) industrySel.onchange = e=> s.industry = e.target.value;
+    const salesSel = overlay.querySelector('#cq_sales');
+    if(salesSel) salesSel.onchange = e=> s.assignedSales = e.target.value;
+
+    overlay.querySelector('#cq_package').onchange = e=>{
+      selectPackageOnQC(e.target.value);
+      renderCreateQuotationModal();
+    };
+    overlay.querySelector('#cq_qdate').onchange = e=>{ s.quotationDate = e.target.value; renderCreateQuotationModal(); };
+    overlay.querySelector('#cq_validUntil').onchange = e=>{ s.validUntil = e.target.value; refreshQcPreview(overlay); };
+    overlay.querySelector('#cq_demoLink').oninput = e=>{ s.demoLink = e.target.value; refreshQcPreview(overlay); };
+    if(!Array.isArray(s.demoLinks)) s.demoLinks = [];
+    overlay.querySelectorAll('[data-demolink-extra]').forEach(inp=>{
+      inp.oninput = e=>{ s.demoLinks[Number(inp.dataset.demolinkExtra)] = e.target.value; refreshQcPreview(overlay); };
+    });
+    overlay.querySelectorAll('[data-remove-demolink]').forEach(btn=>{
+      btn.onclick = ()=>{ s.demoLinks.splice(Number(btn.dataset.removeDemolink), 1); renderCreateQuotationModal(); };
+    });
+    const addDemoLinkBtn = overlay.querySelector('#cq_addDemoLink');
+    if(addDemoLinkBtn) addDemoLinkBtn.onclick = ()=>{ if(s.demoLinks.length<2){ s.demoLinks.push(''); renderCreateQuotationModal(); } };
+
+    overlay.querySelector('#cq_domainName').oninput = e=>{ s.domainName = e.target.value; refreshQcPreview(overlay); };
+
+    // Annual Cost Breakdown wiring (spec §D) — every Year 1/2/3 field routes
+    // through refreshQcPreview (never a full remount) so editing costs never
+    // disturbs left-panel scroll position or preview zoom (spec §12/§13).
+    // The only fields that need a remount are the ones that change what
+    // OTHER fields on screen look like (a mode toggle enabling/disabling a
+    // sibling input, or the readonly/locked state of the domain amount).
+    const ac = normalizeAnnualCost(s.annualCost);
+    s.annualCost = ac;
+    const y1Domain = overlay.querySelector('#cq_y1_domain'); if(y1Domain) y1Domain.oninput = e=>{ ac.year1.domain = e.target.value; refreshQcPreview(overlay); };
+    const y1DomainMode = overlay.querySelector('#cq_y1_domainMode'); if(y1DomainMode) y1DomainMode.onchange = e=>{ ac.year1.domainMode = e.target.value; renderCreateQuotationModal(); };
+    const y1Hosting = overlay.querySelector('#cq_y1_hosting'); if(y1Hosting) y1Hosting.oninput = e=>{ ac.year1.hosting = e.target.value; refreshQcPreview(overlay); };
+    const y1HostingInc = overlay.querySelector('#cq_y1_hostingIncluded'); if(y1HostingInc) y1HostingInc.onchange = e=>{ ac.year1.hostingIncluded = e.target.checked; renderCreateQuotationModal(); };
+    // Generalized per-year Maintenance COST vs NOTE wiring (Year 1/2/3 fully
+    // independent — see the big comment above normalizeAnnualCost()). The
+    // amount field only ever feeds qcAnnualYearMaintenanceCharge() when
+    // `maintenanceInclude` is also true; the Note controls never touch
+    // `maintenance`/`maintenanceInclude`, so they can never change any
+    // year's Total/Subtotal/Payment Schedule.
+    [1,2,3].forEach(n=>{
+      const yr = ac['year'+n];
+      const maintInput = overlay.querySelector(`#cq_y${n}_maint`); if(maintInput) maintInput.oninput = e=>{ yr.maintenance = e.target.value; refreshQcPreview(overlay); };
+      const includeToggle = overlay.querySelector(`#cq_y${n}_maintInclude`); if(includeToggle) includeToggle.onchange = e=>{ yr.maintenanceInclude = e.target.checked; renderCreateQuotationModal(); };
+      const noteEnabled = overlay.querySelector(`#cq_y${n}_maintNoteEnabled`); if(noteEnabled) noteEnabled.onchange = e=>{ yr.maintenanceNote.enabled = e.target.checked; renderCreateQuotationModal(); };
+      const noteType = overlay.querySelector(`#cq_y${n}_maintNoteType`); if(noteType) noteType.onchange = e=>{ yr.maintenanceNote.type = e.target.value; renderCreateQuotationModal(); };
+      const notePeriod = overlay.querySelector(`#cq_y${n}_maintNotePeriod`); if(notePeriod) notePeriod.onchange = e=>{ yr.maintenanceNote.period = e.target.value; renderCreateQuotationModal(); };
+      const noteCustom = overlay.querySelector(`#cq_y${n}_maintNoteCustom`); if(noteCustom) noteCustom.oninput = e=>{ yr.maintenanceNote.customText = e.target.value; refreshQcPreview(overlay); };
+    });
+    const y2Domain = overlay.querySelector('#cq_y2_domain'); if(y2Domain) y2Domain.oninput = e=>{ ac.year2.domain = e.target.value; refreshQcPreview(overlay); };
+    const y2Hosting = overlay.querySelector('#cq_y2_hosting'); if(y2Hosting) y2Hosting.oninput = e=>{ ac.year2.hosting = e.target.value; refreshQcPreview(overlay); };
+    const y2Disp = overlay.querySelector('#cq_y2_display'); if(y2Disp) y2Disp.onchange = e=>{ ac.year2.displayMode = e.target.value; refreshQcPreview(overlay); };
+    const y3Domain = overlay.querySelector('#cq_y3_domain'); if(y3Domain) y3Domain.oninput = e=>{ ac.year3.domain = e.target.value; refreshQcPreview(overlay); };
+    const y3Hosting = overlay.querySelector('#cq_y3_hosting'); if(y3Hosting) y3Hosting.oninput = e=>{ ac.year3.hosting = e.target.value; refreshQcPreview(overlay); };
+    const y3Disp = overlay.querySelector('#cq_y3_display'); if(y3Disp) y3Disp.onchange = e=>{ ac.year3.displayMode = e.target.value; refreshQcPreview(overlay); };
+    const showDetailed = overlay.querySelector('#cq_showDetailed'); if(showDetailed) showDetailed.onchange = e=>{ s.showDetailedBreakdown = e.target.checked; refreshQcPreview(overlay); };
+
+    const toggleAdj = overlay.querySelector('#cq_toggleAdjustments');
+    if(toggleAdj) toggleAdj.onclick = ()=>{
+      s._showAdjustments = !s._showAdjustments;
+      toggleAdj.classList.toggle('open', s._showAdjustments);
+      const body = overlay.querySelector('#cq_adjustmentsBody');
+      if(body) body.hidden = !s._showAdjustments;
+    };
+
+    overlay.querySelector('#cq_addFn').onclick = ()=> openAddQuotationFunctionModal((fnDef)=>{
+      s.items.push({ id: fnId(), module:'Add-on', name: fnDef.name, price: fnDef.defaultPrice, priceType: fnDef.priceType||'manual', editableOnQuotation: fnDef.editableOnQuotation!==undefined?fnDef.editableOnQuotation:(fnDef.priceType==='manual'), included:true });
+      renderCreateQuotationModal();
+    });
+    wireQuotationItemsEditor(overlay, s);
+
+    const discountInput = overlay.querySelector('#cq_discount');
+    if(discountInput) discountInput.oninput = e=>{ s.discountPct = e.target.value; renderCreateQuotationModal(); };
+    const adjustInput = overlay.querySelector('#cq_adjust');
+    if(adjustInput) adjustInput.oninput = e=>{ s.adjustment = e.target.value; renderCreateQuotationModal(); };
+    const adjustReason = overlay.querySelector('#cq_adjustReason');
+    if(adjustReason) adjustReason.oninput = e=>{ s.adjustmentReason = e.target.value; };
+
+    overlay.querySelector('#cq_paymentPreset').onchange = e=>{ s.paymentPreset = e.target.value; renderCreateQuotationModal(); };
+    overlay.querySelector('#cq_clientNote').oninput = e=>{ s.clientNote = e.target.value; refreshQcPreview(overlay); };
+
+    overlay.querySelector('#cqSave').onclick = function(){ return runSave(this, ()=> saveQuotationFromState(s)); };
+  }});
+}
+
+function refreshQcPreview(overlay){
+  const s = QC_STATE;
+  // refreshQcPreview (not a full remount) is the shared path for every
+  // field that updates live without disturbing scroll/zoom (client name,
+  // phone, domain name, every Annual Cost Breakdown amount, etc.) — the
+  // beforeunload guard is re-evaluated here too, not only in onMount's
+  // full-remount path (see wireCreateQuotationModal/renderCreateQuotation
+  // Modal), so typing into one of these fields enables browser-level
+  // protection immediately rather than only after the next full remount.
+  qcSetBeforeUnloadGuard(qcIsDirty());
+  const totals = qcComputeQuoteTotals(s);
+  overlay.querySelector('#cq_authorityBanner').innerHTML = pricingNotesHtml({...totals.evalRes, finalPrice: totals.year1Total});
+  // Keep the three per-year mini totals in the Annual Cost Breakdown panel
+  // itself live too (spec §29: "no stale totals") — every other field in
+  // that section already routes through this same function.
+  const y1TotalEl = overlay.querySelector('.qc-year-block:nth-of-type(1) .qc-year-total');
+  if(y1TotalEl) y1TotalEl.textContent = totals.evalRes.priceIsTBC ? 'TBC' : moneyPrecise(totals.year1Total);
+  const y2TotalEl = overlay.querySelector('.qc-year-block:nth-of-type(2) .qc-year-total');
+  if(y2TotalEl) y2TotalEl.textContent = qcYearAmountDisplay(totals.year2Total, totals.annualCost.year2.displayMode);
+  const y3TotalEl = overlay.querySelector('.qc-year-block:nth-of-type(3) .qc-year-total');
+  if(y3TotalEl) y3TotalEl.textContent = qcYearAmountDisplay(totals.year3Total, totals.annualCost.year3.displayMode);
+  // Each year's Maintenance Note inline "Note preview" text (informational
+  // only — kept live on every keystroke without a full remount, same as the
+  // year totals above).
+  [1,2,3].forEach(n=>{
+    const previewEl = overlay.querySelector(`#cq_y${n}_maintNotePreview`);
+    if(!previewEl) return;
+    const yr = totals.annualCost['year'+n];
+    previewEl.textContent = yr.maintenanceNote.enabled ? (maintenanceNoteSentence(yr.maintenanceNote, yr.maintenance) || '(enter wording above)') : '';
+  });
+  const preview = overlay.querySelector('#cq_livePreview');
+  if(preview) paintQuotePreview(preview, qcStateToPreviewQuotation(s, totals.evalRes, totals.schedule), ()=>qcApplyZoom(overlay));
+  else qcApplyZoom(overlay);
+}
+
+/* ---------------------------------------------------------------------- */
+/* Live preview zoom (screen-only — never affects the printed document)   */
+/* ---------------------------------------------------------------------- */
+
+// The actual "Fit" ratio for the panel's current width — used both to
+// render the page and as the starting point for +/- so zooming in/out
+// always feels continuous from whatever "Fit" was just showing.
+function qcCurrentFitZoom(overlay){
+  const canvas = overlay.querySelector('#qcPreviewCanvas');
+  if(!canvas) return 1;
+  const available = canvas.clientWidth - 32; // minus the canvas's own side padding
+  if(!available || available<=0) return 1;
+  return Math.max(0.3, Math.min(1.5, available / QC_A4_PAGE_WIDTH_PX));
+}
+function qcApplyZoom(overlay){
+  const canvas = overlay.querySelector('#qcPreviewCanvas');
+  const scaleEl = overlay.querySelector('#qcA4Scale');
+  if(!canvas || !scaleEl) return;
+  const z = QC_ZOOM==='fit' ? qcCurrentFitZoom(overlay) : QC_ZOOM;
+  // `zoom` (not `transform:scale`) so the panel's scrollable height tracks
+  // the scaled page automatically — no manual height/overflow math needed
+  // to keep the internal vertical scrollbar correct at any zoom level.
+  scaleEl.style.zoom = z;
+}
+// Recomputes "Fit" on window resize while a Create/Edit Quotation modal is
+// open. Only one listener is ever live at a time (each call removes the
+// previous one first) so re-rendering the modal repeatedly never piles up
+// duplicate handlers.
+let QC_RESIZE_HANDLER = null;
+function qcWireResize(overlay){
+  if(QC_RESIZE_HANDLER) window.removeEventListener('resize', QC_RESIZE_HANDLER);
+  QC_RESIZE_HANDLER = ()=>{
+    if(!document.body.contains(overlay)){ window.removeEventListener('resize', QC_RESIZE_HANDLER); QC_RESIZE_HANDLER = null; return; }
+    if(QC_ZOOM==='fit') qcApplyZoom(overlay);
+  };
+  window.addEventListener('resize', QC_RESIZE_HANDLER);
+}
+
+// Root-cause fix (BizWeb CRM -- Replace Founder Review with Configurable
+// Package Add-On Pricing): replaces the old "Founder Review Required" /
+// "Within Sales Quoting Authority" approval-gate banner. Sales no longer
+// needs anyone's permission to build or send ANY package/quotation --
+// this is now purely informational: it lists any items still needing a
+// Manual price, or an above-limit discount/adjustment note, with no
+// blocking implication. Shows nothing at all once there's nothing to
+// flag.
+function pricingNotesHtml(evalRes){
+  if(!evalRes.reasons || !evalRes.reasons.length) return '';
+  const tbc = evalRes.priceIsTBC;
+  return `<div class="panel" style="border-color:${tbc?'var(--orange,#d98a12)':'var(--blue,#1d7bff)'};background:${tbc?'#fff8ec':'#eef4ff'};padding:12px 14px;margin-top:12px">
+    <strong style="color:${tbc?'#a56206':'#1d4ed8'}">${tbc?'⚠ Pricing Needed':'ℹ Pricing Notes'}</strong>
+    <ul style="margin:6px 0 0;padding-left:18px;font-size:12.5px;color:var(--navy)">${evalRes.reasons.map(r=>`<li>${escapeHtml(r)}</li>`).join('')}</ul>
+    <div style="margin-top:8px;font-size:13px">Year 1 Total: <b>${tbc?'TBC':moneyPrecise(evalRes.finalPrice)}</b></div>
+  </div>`;
+}
+
+// Opened from INSIDE the Create/Edit Quotation modal — this is always a
+// CHILD modal (openChildModal/closeChildModal, its own separate overlay
+// stacked on top), never openModal()/closeModal(), specifically so opening
+// or cancelling it can never touch, remount, or reset the parent Create
+// Quotation modal's DOM, form state, scroll position, or preview zoom
+// (spec §6/§7 — this is the actual fix for the reported "Cancel resets
+// Create Quotation" bug: the two modals no longer share one overlay).
+function openAddQuotationFunctionModal(onPick){
+  const html = `
+    <div class="modal-head"><h3>Add Scope Item</h3><button class="modal-close" id="afqClose">&times;</button></div>
+    <div class="modal-body">
+      <div class="form-field" style="margin-bottom:4px">
+        <label>A. Add Existing Function</label>
+        <select id="afq_pick" class="sel" style="width:100%">
+          <option value="">Select a function…</option>
+          ${ADDITIONAL_FUNCTIONS_CATALOG.map(a=>`<option value="${a.id}">${escapeHtml(a.name)} — ${a.priceType==='manual'?'Manual (enter amount)':'$'+a.defaultPrice}</option>`).join('')}
+        </select>
+      </div>
+      <div class="flex-row" style="justify-content:center;margin:10px 0"><span class="text-muted" style="font-size:11.5px;font-weight:700;letter-spacing:.4px">OR</span></div>
+      <div class="form-field" style="margin-bottom:4px">
+        <label>B. Add Custom Function</label>
+        <input id="afq_custom" placeholder="Custom item name — e.g. Loyalty points system">
+      </div>
+      <p class="text-muted" style="font-size:11.5px;margin:8px 0 0">Pick one option — a custom item is always Manual pricing (enter the amount agreed with Founder/client; shows as TBC until you do).</p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-secondary" id="afqCancel">Cancel</button>
+      <button class="btn btn-primary" id="afqAdd" disabled>Add</button>
+    </div>
+  `;
+  openChildModal(html, { onMount:(overlay)=>{
+    const pickSel = overlay.querySelector('#afq_pick');
+    const customInput = overlay.querySelector('#afq_custom');
+    const addBtn = overlay.querySelector('#afqAdd');
+    // Neither option is required on its own, but they're mutually exclusive:
+    // picking a catalog function clears/disables the custom name field and
+    // vice versa, and the Add button activates only once exactly one valid
+    // option is provided (spec §8).
+    const sync = ()=>{
+      const hasPick = !!pickSel.value;
+      const hasCustom = !!customInput.value.trim();
+      customInput.disabled = hasPick;
+      pickSel.disabled = hasCustom;
+      addBtn.disabled = !(hasPick || hasCustom);
+    };
+    pickSel.onchange = sync;
+    customInput.oninput = sync;
+    sync();
+
+    overlay.querySelector('#afqClose').onclick = closeChildModal;
+    overlay.querySelector('#afqCancel').onclick = closeChildModal;
+    addBtn.onclick = ()=>{
+      const pickId = pickSel.value;
+      const custom = customInput.value.trim();
+      if(pickId){
+        const def = ADDITIONAL_FUNCTIONS_CATALOG.find(a=>a.id===pickId);
+        closeChildModal(); onPick(def); return;
+      }
+      if(custom){
+        closeChildModal(); onPick({ name: custom, defaultPrice: null, priceType:'manual', editableOnQuotation:true }); return;
+      }
+      toast('Pick an item from the catalog, or type a custom one.', 'error');
+    };
+  }});
+}
+
+// Root-cause fix (BizWeb CRM -- Replace Founder Review with Configurable
+// Package Add-On Pricing): a 'manual' (or any editableOnQuotation) item
+// now gets a real, live amount input right in this editor -- previously
+// NO price was ever editable here for ANY role, which is why a TBC price
+// could only ever be resolved through the old Founder-approval detour.
+// Entering a value fires an immediate full recompute (req #7: "Once an
+// amount is entered, recalculate immediately"); clearing it goes back to
+// TBC for that one item only, never the whole quotation.
+function quotationItemsEditorHtml(items){
+  if(!items.length) return `<div class="empty-row">Select a package to load its included scope items.</div>`;
+  return `
+    <div class="table-wrap scroll-x">
+      <table class="data-table qc-mini-table">
+        <thead><tr><th>Include</th><th>Module</th><th>Item</th><th>Price</th><th></th></tr></thead>
+        <tbody>
+          ${items.map(it=>{
+            const isTbc = it.price===null || it.price===undefined;
+            const canEditPrice = it.included!==false && (it.priceType==='manual' || it.editableOnQuotation);
+            const priceCell = canEditPrice
+              ? `<input type="number" step="0.01" data-price="${it.id}" value="${isTbc?'':it.price}" placeholder="${isTbc?'Enter amount':''}" style="width:100px">`
+              : (isTbc ? 'TBC' : moneyPrecise(it.price));
+            return `
+            <tr data-item="${it.id}">
+              <td><input type="checkbox" data-inc="${it.id}" ${it.included!==false?'checked':''}></td>
+              <td>${escapeHtml(it.module)}</td>
+              <td>${escapeHtml(it.name)}${isTbc && it.included!==false?' <span class="badge chip-overdue" style="margin-left:4px">Needs Price</span>':''}</td>
+              <td>${priceCell}</td>
+              <td><span class="icon-btn" data-remove-item="${it.id}" title="Remove" style="font-size:15px;cursor:pointer">&times;</span></td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+function wireQuotationItemsEditor(overlay, s){
+  overlay.querySelectorAll('[data-inc]').forEach(cb=> cb.onchange = ()=>{
+    const it = s.items.find(x=>x.id===cb.dataset.inc);
+    it.included = cb.checked;
+    renderCreateQuotationModal();
+  });
+  overlay.querySelectorAll('[data-remove-item]').forEach(x=> x.onclick = ()=>{
+    s.items = s.items.filter(i=>i.id!==x.dataset.removeItem);
+    renderCreateQuotationModal();
+  });
+  overlay.querySelectorAll('[data-price]').forEach(inp=> inp.onchange = ()=>{
+    const it = s.items.find(x=>x.id===inp.dataset.price);
+    const raw = inp.value.trim();
+    it.price = raw==='' ? null : Number(raw);
+    renderCreateQuotationModal();
+  });
+}
+
+/* ---------------------------------------------------------------------- */
+/* Save                                                                    */
+/* ---------------------------------------------------------------------- */
+
+// The consolidated "D. Annual Cost Breakdown" section — replaces the old
+// "Domain & Infrastructure" / "Maintenance & Support" / "Year-by-Year Cost"
+// sections with ONE Year 1 / Year 2 / Year 3 block each (spec §2). Every
+// dollar figure here has exactly one home — no duplicate Domain Cost,
+// Domain Renewal Estimate, or Maintenance Cost fields anywhere else on the
+// form (spec §9).
+// Year 1 Maintenance Benefit sub-section — fully independent of the
+// Maintenance & Support cost field above it (task spec: "Separate Year 1
+// Maintenance Cost (financial) from Year 1 Maintenance Remark (informational,
+// zero price impact)"). Visually marked as non-financial with a small
+// uppercase sub-header + a neutral/gray "No Price Impact" pill, reusing the
+// existing `field-tbc-badge` neutral-badge convention (adapted wording) —
+// never a new visual language. This control never writes to annualCost's
+// domain/hosting/maintenance cost fields, so it can never affect Year 1
+// Total/Subtotal/Payment Schedule.
+// Generalized per-year "Maintenance Cost vs Note" sub-section (replaces the
+// prior task's Year-1-only year1MaintenanceRemarkSectionHtml — same visual
+// language, reused 3× with an added Note Type dimension). Two fully
+// independent toggles: "Include Maintenance in Year N Budget" (financial —
+// see qcAnnualYearMaintenanceCharge) and "Show Maintenance Note in Important
+// Notes" (informational — see maintenanceImportantNotes). Neither one's
+// control ever writes to the other's underlying field.
+function maintenanceYearSectionHtml(n, yr){
+  const note = yr.maintenanceNote;
+  const typeOptions = MAINT_NOTE_TYPES.map(t=>`<option value="${t}" ${note.type===t?'selected':''}>${MAINT_NOTE_TYPE_LABELS[t]}</option>`).join('');
+  const periodOptions = MAINT_NOTE_PERIODS.map(p=>`<option value="${p}" ${note.period===p?'selected':''}>${p}</option>`).join('');
+  const previewText = note.enabled ? escapeHtml(maintenanceNoteSentence(note, yr.maintenance) || '(enter wording above)') : '';
+  const showPeriod = note.type==='freePeriod';
+  const showCustom = (note.type==='freePeriod' && note.period==='Custom') || note.type==='custom';
+  // Year 1's "Show ... Maintenance Note" row is the direct descendant of the
+  // old, single "Year 1 Maintenance Benefit" checkbox+label control (spec:
+  // "CRM Create Quotation - Fix Year 1 Maintenance Benefit Layout Only",
+  // 2026-09-14) -- CSS/markup-order fix ONLY: the toggle now renders before
+  // its label (checkbox-then-text, one row, left-aligned, via the new
+  // `field-toggle-row-left` class below, which overrides ONLY
+  // justify-content and is fully additive -- .field-toggle-row/.toggle-
+  // switch themselves are untouched, so every other toggle row in the app
+  // (Year 1/2/3 "Include Maintenance in Budget", Year 1 "Included in
+  // package price", Year 2/3's own Show-Note rows, and anything in
+  // Settings) keeps its exact current layout). Wiring (`id`, checked state,
+  // onchange handlers in renderCreateQuotationModal) is completely
+  // unchanged -- purely a visual/order change for this one row.
+  const showNoteToggleRow = n===1
+    ? `<label class="field-toggle-row field-toggle-row-left" style="margin-top:6px"><span class="toggle-switch"><input type="checkbox" id="cq_y${n}_maintNoteEnabled" ${note.enabled?'checked':''}><span class="toggle-slider"></span></span><span>Show Year 1 Maintenance Note</span></label>`
+    : `<label class="field-toggle-row" style="margin-top:6px"><span>Show Maintenance Note in Important Notes</span><span class="toggle-switch"><input type="checkbox" id="cq_y${n}_maintNoteEnabled" ${note.enabled?'checked':''}><span class="toggle-slider"></span></span></label>`;
+  return `
+    <div class="form-field full" style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--line)">
+      <div class="text-muted" style="font-size:10.5px;text-transform:uppercase;letter-spacing:.4px;font-weight:800;margin-bottom:6px">
+        Year ${n} Maintenance
+      </div>
+      <label class="field-toggle-row"><span>Include Maintenance in Year ${n} Budget</span><span class="toggle-switch"><input type="checkbox" id="cq_y${n}_maintInclude" ${yr.maintenanceInclude?'checked':''}><span class="toggle-slider"></span></span></label>
+      ${showNoteToggleRow}
+      ${note.enabled ? `
+        <div style="margin-top:6px"><span class="field-tbc-badge">No Price Impact</span></div>
+        <div class="form-grid" style="margin-top:8px">
+          <div class="form-field"><label>Maintenance Note Type</label>
+            <select id="cq_y${n}_maintNoteType" class="sel">${typeOptions}</select>
+          </div>
+          ${showPeriod ? `<div class="form-field"><label>Free Period</label><select id="cq_y${n}_maintNotePeriod" class="sel">${periodOptions}</select></div>` : ''}
+          ${showCustom ? `<div class="form-field full"><label>Custom Wording</label><textarea id="cq_y${n}_maintNoteCustom" placeholder="${note.type==='custom'?'Full custom maintenance note sentence…':'e.g. Free basic support for the first 6 weeks after launch.'}">${escapeHtml(note.customText)}</textarea></div>` : ''}
+        </div>
+        <div class="text-muted" style="font-size:11.5px;margin-top:6px">Note preview: &ldquo;Year ${n} Maintenance: <span id="cq_y${n}_maintNotePreview">${previewText}</span>&rdquo;</div>
+      ` : ''}
+    </div>
+  `;
+}
+
+function annualCostBreakdownHtml(s, svc, totals){
+  const hostingLabel = hostingLabelForService(svc);
+  const ac = totals.annualCost;
+  const y1 = ac.year1, y2 = ac.year2, y3 = ac.year3;
+  const y1DomainNote = y1.domainMode==='client_own'
+    ? `<div class="text-muted" style="font-size:11px;margin-top:4px">Existing / client-owned domain — no domain cost charged.</div>` : '';
+  const y1HostingBadge = y1.hostingIncluded ? `<span class="field-included-badge">Included</span>` : '';
+  const y1DomainBadge = y1.domainMode==='included' ? `<span class="field-included-badge">Included</span>` : '';
+  return `
+    <div class="qc-year-block">
+      <div class="qc-year-head"><h4>Year 1</h4><span class="qc-year-total">${totals.evalRes.priceIsTBC?'TBC':moneyPrecise(totals.year1Total)}</span></div>
+      <div class="form-grid">
+        <div class="form-field full"><label>Website / System Development <span class="field-auto-badge">Auto</span></label>
+          <input value="${moneyPrecise(totals.year1Development)}" readonly class="field-locked"></div>
+        <div class="form-field"><label>Domain ($) ${y1DomainBadge}</label><input type="number" step="0.01" id="cq_y1_domain" value="${y1.domain}" ${y1.domainMode!=='separate'?'readonly class="field-locked"':''}></div>
+        <div class="form-field"><label>Domain Status</label>
+          <select id="cq_y1_domainMode" class="sel">
+            <option value="included" ${y1.domainMode==='included'?'selected':''}>Included</option>
+            <option value="separate" ${y1.domainMode==='separate'?'selected':''}>Charged Separately</option>
+            <option value="client_own" ${y1.domainMode==='client_own'?'selected':''}>Client Own Domain</option>
+          </select>
+          ${y1DomainNote}
+        </div>
+        <div class="form-field"><label>${escapeHtml(hostingLabel)} ($) ${y1HostingBadge}</label>
+          <input type="number" step="0.01" id="cq_y1_hosting" value="${y1.hosting}" ${y1.hostingIncluded?'readonly class="field-locked"':''}>
+          <label class="field-toggle-row"><span>Included in package price</span><span class="toggle-switch"><input type="checkbox" id="cq_y1_hostingIncluded" ${y1.hostingIncluded?'checked':''}><span class="toggle-slider"></span></span></label>
+        </div>
+        <div class="form-field"><label>Maintenance & Support ($)</label>
+          <input type="number" step="0.01" id="cq_y1_maint" value="${y1.maintenance}">
+        </div>
+      </div>
+      ${maintenanceYearSectionHtml(1, y1)}
+    </div>
+
+    <div class="qc-year-block">
+      <div class="qc-year-head"><h4>Year 2</h4><span class="qc-year-total">${qcYearAmountDisplay(totals.year2Total, y2.displayMode)}</span></div>
+      <div class="form-grid">
+        <div class="form-field"><label>Domain Renewal ($)</label><input type="number" step="0.01" id="cq_y2_domain" value="${y2.domain}"></div>
+        <div class="form-field"><label>${escapeHtml(hostingLabel)} ($)</label><input type="number" step="0.01" id="cq_y2_hosting" value="${y2.hosting}"></div>
+        <div class="form-field"><label>Maintenance & Support ($)</label><input type="number" step="0.01" id="cq_y2_maint" value="${y2.maintenance}"></div>
+        <div class="form-field"><label>Amount Display ${y2.displayMode==='tbc'?'<span class="field-tbc-badge">TBC</span>':''}</label>
+          <select id="cq_y2_display" class="sel">
+            <option value="exact" ${y2.displayMode==='exact'?'selected':''}>Exact Amount</option>
+            <option value="estimated" ${y2.displayMode==='estimated'?'selected':''}>Estimated Amount</option>
+            <option value="tbc" ${y2.displayMode==='tbc'?'selected':''}>To be confirmed</option>
+          </select>
+        </div>
+      </div>
+      ${maintenanceYearSectionHtml(2, y2)}
+    </div>
+
+    <div class="qc-year-block" style="margin-bottom:6px">
+      <div class="qc-year-head"><h4>Year 3</h4><span class="qc-year-total">${qcYearAmountDisplay(totals.year3Total, y3.displayMode)}</span></div>
+      <div class="form-grid">
+        <div class="form-field"><label>Domain Renewal ($)</label><input type="number" step="0.01" id="cq_y3_domain" value="${y3.domain}"></div>
+        <div class="form-field"><label>${escapeHtml(hostingLabel)} ($)</label><input type="number" step="0.01" id="cq_y3_hosting" value="${y3.hosting}"></div>
+        <div class="form-field"><label>Maintenance & Support ($)</label><input type="number" step="0.01" id="cq_y3_maint" value="${y3.maintenance}"></div>
+        <div class="form-field"><label>Amount Display ${y3.displayMode==='tbc'?'<span class="field-tbc-badge">TBC</span>':''}</label>
+          <select id="cq_y3_display" class="sel">
+            <option value="exact" ${y3.displayMode==='exact'?'selected':''}>Exact Amount</option>
+            <option value="estimated" ${y3.displayMode==='estimated'?'selected':''}>Estimated Amount</option>
+            <option value="tbc" ${y3.displayMode==='tbc'?'selected':''}>To be confirmed</option>
+          </select>
+        </div>
+      </div>
+      ${maintenanceYearSectionHtml(3, y3)}
+    </div>
+    <p class="text-muted" style="font-size:11.5px;margin:0 0 6px">Development is a one-time, Year-1-only cost. Year 2 and Year 3 are renewal/support costs only — Development is never charged again.</p>
+    ${isFounder() ? `<label style="display:flex;align-items:center;gap:6px;font-weight:400;font-size:12.5px;margin:8px 0 16px"><input type="checkbox" id="cq_showDetailed" ${s.showDetailedBreakdown?'checked':''}> Show Detailed Annual Breakdown on the client-facing document</label>` : ''}
+  `;
+}
+
+async function saveQuotationFromState(s){
+  // Business Name is OPTIONAL (spec §1) — Client Name alone is enough to
+  // create and save a quotation. Business Name still saves/prints if the
+  // client has one; when blank, quoteInfoRows() below simply omits that row
+  // from the client-facing document rather than showing an empty
+  // "Business Name: " line.
+  if(!s.clientName || !s.clientName.trim()){ toast('Client Name is required.', 'error'); return; }
+  if(!s.packageKey){ toast('Please select a package.', 'error'); return; }
+  if(isFounder() && s.adjustment && !s.adjustmentReason.trim()){ toast('A Reason for Price Adjustment is required.', 'error'); return; }
+
+  const svc = serviceByProjectType(s.packageKey);
+  const activeItems = s.items.filter(i=>i.included!==false);
+  const evalRes = evaluateQuotation({
+    items: activeItems.map(i=>({name:i.name, price:i.price, priceType:i.priceType})),
+    basePackage: svc, discountPct: isFounder() ? (Number(s.discountPct)||0) : 0,
+    manualAdjustment: (isFounder() && s.adjustment) ? { amount:Number(s.adjustment), reason:s.adjustmentReason } : null,
+    discountLimitPct: effectiveDiscountLimit(svc),
+  });
+
+  // Annual Cost Breakdown totals (spec §10) — Year 1 Total = development +
+  // scope add-ons − discount + adjustment (already exactly what `evalRes`
+  // above computes) PLUS the chargeable Year 1 domain/hosting/maintenance
+  // amounts. Year 2/3 = domain + hosting/backend/database + maintenance,
+  // never Development again.
+  const annualCost = normalizeAnnualCost(s.annualCost);
+  const year1Charge = qcAnnualYear1Charge(annualCost.year1);
+
+  // Root-cause fix (Year 1 Total audit, "survives editing" requirement):
+  // the Create/Edit Quotation items editor never lets ANY role type a
+  // price into an open-scope ("TBC") function -- the only place that ever
+  // resolves one is the Approve / Confirm Final Price modal, which only
+  // ever writes the resolved number into q.year1Total (an aggregate), not
+  // back into that item's own `price` field (which stays null forever --
+  // there is nowhere in the UI to put a per-item number). Without this,
+  // re-opening an already-resolved quotation in Edit and saving it again
+  // -- even for an unrelated change like fixing a typo -- would recompute
+  // evalRes fresh from those still-null item prices and silently revert a
+  // correctly-priced, Approved quotation back to "TBC", wiping out the
+  // Founder-confirmed Year 1 Total. Guard against that specific case: only
+  // when editing an EXISTING quotation that was already resolved
+  // (existing.year1Total is a real number) AND the fresh computation says
+  // TBC again AND the reason is the SAME open-scope item(s) that were
+  // already unresolved before (not some brand-new function the edit just
+  // added), carry the previously-confirmed Year 1 Total/schedule forward
+  // instead of recomputing from the still-null item price. Any edit that
+  // adds a genuinely NEW unresolved item still correctly re-opens TBC/
+  // Founder review for that new item, exactly as it should.
+  const existingForTbcCheck = s.editingId ? DB.find('quotations', s.editingId) : null;
+  const newTbcNames = new Set(activeItems.filter(i=> i.price===null || i.price===undefined).map(i=>i.name));
+  const existingTbcNames = existingForTbcCheck
+    ? new Set((existingForTbcCheck.items||[]).filter(i=> i.price===null || i.price===undefined).map(i=>i.name))
+    : new Set();
+  const introducesNewUnresolvedItem = [...newTbcNames].some(n=> !existingTbcNames.has(n));
+  const preservePriorResolution = !!(existingForTbcCheck && existingForTbcCheck.year1Total!=null && evalRes.priceIsTBC && !introducesNewUnresolvedItem);
+
+  const year1Total = preservePriorResolution
+    ? existingForTbcCheck.year1Total
+    : (evalRes.priceIsTBC ? null : Math.round((evalRes.finalPrice + year1Charge)*100)/100);
+  const year2Total = qcAnnualYearTotal(annualCost.year2);
+  const year3Total = qcAnnualYearTotal(annualCost.year3);
+  const schedule = preservePriorResolution
+    ? (existingForTbcCheck.paymentSchedule && existingForTbcCheck.paymentSchedule.length ? existingForTbcCheck.paymentSchedule : computePaymentSchedule(year1Total, s.paymentPreset, s.customStages))
+    : computePaymentSchedule(evalRes.priceIsTBC?0:year1Total, s.paymentPreset, s.customStages);
+  // Legacy-mirror maintenance object — kept in sync with annualCost so every
+  // existing consumer (buildQuoteSections' Year 2/3 math for records not
+  // using the new model, maintenanceWordingNotes(), etc.) keeps working
+  // unchanged. Sales/Founder never edit this directly any more — it's
+  // derived, not a second source of truth.
+  const legacyMaintenance = {
+    year1Mode: annualCost.year1.maintenanceInclude ? 'paid' : 'not_included', year1Cost: annualCost.year1.maintenance,
+    year2Cost: annualCost.year2.maintenance, year3Cost: annualCost.year3.maintenance,
+    year2DisplayMode: annualCost.year2.displayMode, year3DisplayMode: annualCost.year3.displayMode,
+  };
+
+  let existing = s.editingId ? DB.find('quotations', s.editingId) : null;
+  let isNewRevision = false;
+  let id, rootQuotationId, version, previousVersionId, quoteNumber, createdAt, createdBy;
+
+  if(existing && existing.status==='Draft'){
+    // Draft is mutable in place — no version bump, same id/number.
+    id = existing.id; rootQuotationId = existing.rootQuotationId || existing.id;
+    version = existing.version||1; previousVersionId = existing.previousVersionId||null;
+    quoteNumber = existing.quoteNumber; createdAt = existing.createdAt; createdBy = existing.createdBy;
+  } else if(existing){
+    // Already Sent/Approved/Accepted/etc — editing creates a NEW revision row
+    // and marks the old one Superseded (spec §22): every version is kept,
+    // nothing is silently overwritten.
+    isNewRevision = true;
+    id = null;                                   // the server assigns the id and the new revision's quotation number
+    rootQuotationId = existing.rootQuotationId || existing.id;
+    version = (existing.version||1) + 1;
+    previousVersionId = existing.id;
+    quoteNumber = null;
+    createdAt = new Date().toISOString(); createdBy = CURRENT_USER.name;
+  } else {
+    id = null;                                   // the server assigns the id and the quotation number
+    rootQuotationId = null; version = 1; previousVersionId = null;
+    quoteNumber = null;
+    createdAt = new Date().toISOString(); createdBy = CURRENT_USER.name;
+  }
+
+  const notesList = s.notesOverride || (quotationDefaults().notes[QC_STATE.quotationType]||[]);
+  const withClientNote = s.clientNote ? [...notesList, { key:'clientNote', title:'Client-Specific Note', text:s.clientNote }] : notesList;
+  const finalNotes = [...withClientNote, ...annualCostHiddenNotes(annualCost, !!s.showDetailedBreakdown)];
+
+  const quotation = {
+    id, quoteNumber, rootQuotationId, version, previousVersionId,
+    leadId: s.leadId, projectCode: s.projectCode || null,
+    clientName: s.clientName, businessName: s.businessName, phone: s.phone, telegram: s.telegram,
+    industry: s.industry, interestedService: s.interestedService,
+    packageKey: s.packageKey, packageName: svc ? svc.name : s.packageKey,
+    quotationType: quotationTypeForProjectType(s.packageKey),
+    assignedSales: s.assignedSales,
+    currency:'USD',
+    domainName: s.domainName,
+    domainCost: annualCost.year1.domain, domainIncluded: annualCost.year1.domainMode!=='separate', domainRenewalEstimate: annualCost.year2.domain,
+    maintenance: legacyMaintenance,
+    // Root-cause fix (Year 1 Total audit): priceIsTBC was never an
+    // independent field on the saved record -- rowToQuotation() only ever
+    // DERIVES it (year1_total==null) on a real Supabase round-trip (a page
+    // refresh). DB.upsert()'s optimistic in-memory cache update stores
+    // whatever object this function hands it verbatim, with no such
+    // round-trip, so every consumer's `if(q.priceIsTBC)` check (table,
+    // detail modal, preview, mini-cards, the button logic above) silently
+    // read `undefined` -- falsy, same as false -- for any quotation
+    // created or edited in the CURRENT session, showing "Mark as Sent" /
+    // a blank-looking total instead of "TBC" until a hard refresh forced
+    // the derive-from-Supabase path to run. Setting it explicitly here,
+    // with the EXACT SAME derivation rowToQuotation uses, makes the two
+    // paths agree immediately instead of only after a refresh.
+    priceIsTBC: year1Total==null,
+    year1Total, year2Total, year3Total,
+    discountPct: isFounder() ? (Number(s.discountPct)||0) : 0,
+    manualAdjustment: (isFounder() && s.adjustment) ? { amount:Number(s.adjustment), reason:s.adjustmentReason } : null,
+    paymentPreset: s.paymentPreset, quotationDate: s.quotationDate, validUntil: s.validUntil,
+    demoLink: s.demoLink,
+    demoLinks: s.demoLinks||[],
+    items: activeItems.map(i=>({ id:i.id, module:i.module, name:i.name, price:i.price, priceType:i.priceType, editableOnQuotation:i.editableOnQuotation })),
+    exclusions: s.exclusions, importantNotes: finalNotes, paymentSchedule: schedule,
+    reasons: evalRes.reasons,
+    status: (existing && existing.status==='Draft') ? existing.status : 'Draft',
+    // Root-cause fix (BizWeb CRM -- Replace Founder Review with
+    // Configurable Package Add-On Pricing, 2026-10-02 approval): the
+    // Founder-approval workflow is removed from quotation pricing
+    // entirely -- there is no more approvalStatus field at all. Sales
+    // discusses complex/custom pricing with Founder externally (Telegram)
+    // and enters the agreed configuration directly; the only thing that
+    // can still make a quotation incomplete is an unresolved Manual-price
+    // item (see priceIsTBC below), which is a pricing-completeness state,
+    // never an approval gate.
+    createdBy, approvedBy: existing ? existing.approvedBy : null,
+    createdAt,
+  };
+
+  // Draft edited in place -> PATCH of what changed; anything else is a NEW row (POST) so no earlier version is ever overwritten.
+  const savedQ = (existing && existing.status==='Draft') ? await DB.update('quotations', quotation) : await DB.create('quotations', quotation);
+  if(!savedQ.ok){ saveFailed(savedQ); return false; }       // the editor stays open with everything typed (the unsaved-changes guard is untouched)
+
+  if(isNewRevision){
+    existing.status = 'Superseded';
+    const sup = await DB.update('quotations', existing);
+    if(!sup.ok) { try{ toast('The new revision was saved, but the previous version could not be marked Superseded: ' + sup.userMessage + ' Please mark it manually.', 'error'); }catch(e){} }
+    logActivity({ userName: CURRENT_USER.name, refType:'quotation', refId: quotation.id, refLabel:`${quotation.quoteNumber} — ${quotation.businessName||quotation.clientName}`,
+      type:'Quotation Superseded', description:`${CURRENT_USER.name} created revision v${version} of ${existing.quoteNumber} — the previous version is now Superseded.`,
+      fromValue: existing.quoteNumber, toValue: quotation.quoteNumber });
+  }
+
+  logActivity({ userName: CURRENT_USER.name, refType:'quotation', refId: quotation.id, refLabel:`${quotation.quoteNumber} — ${quotation.businessName||quotation.clientName}`,
+    type: (s.editingId && !isNewRevision) ? 'Quotation Updated' : 'Quotation Created',
+    description: `${CURRENT_USER.name} ${(s.editingId && !isNewRevision)?'updated':(isNewRevision?'created revision v'+version+' of':'created')} quotation ${quotation.quoteNumber}. Year 1 Total: ${evalRes.priceIsTBC?'TBC':moneyPrecise(year1Total)}.`,
+    remark: evalRes.priceIsTBC ? 'One or more items still need a Manual price.' : null });
+
+  toast(`Quotation ${quotation.quoteNumber} saved as Draft.`, 'success');
+  // Ends unsaved-changes tracking (resets the dirty baseline, removes the
+  // beforeunload listener) on every successful save — whether triggered by
+  // the form's own bottom Save button (no warning ever shown, so nothing to
+  // reset there either way) or by "Save as Draft" from the unsaved-changes
+  // warning dialog. closeModal() right after is the SAME unconditional call
+  // this already made — guard-free by design, since the save just
+  // succeeded and there is nothing left to protect.
+  qcEndDirtyTracking();
+  closeModal();
+  if(currentRoute()==='quotations'){ renderQuotSummaryCards(); renderQuotTable(); }
+  openQuotationDetailModal(quotation.id);
+  return true;
+}
+
+function loadStateFromQuotation(q, { asDuplicate=false } = {}){
+  return {
+    sourceType: q.leadId ? 'lead' : 'new', leadId: q.leadId, projectCode: q.projectCode,
+    clientName: q.clientName, businessName: q.businessName, phone: q.phone, telegram: q.telegram,
+    industry: q.industry, interestedService: q.interestedService,
+    assignedSales: q.assignedSales, packageKey: q.packageKey, quotationType: q.quotationType,
+    discountPct: q.discountPct||0, adjustment: q.manualAdjustment?q.manualAdjustment.amount:0, adjustmentReason: q.manualAdjustment?q.manualAdjustment.reason:'',
+    items: (q.items||[]).map(i=>({...i, included:true})), exclusions: [...(q.exclusions||[])],
+    // Maintenance wording notes (maintenanceY1 / maintenanceRenewal) are
+    // regenerated fresh at save time from the live maintenance state — never
+    // carried over as static text — so they're filtered out here the same
+    // way the per-client `clientNote` already is, to avoid duplicating them
+    // when this quotation is re-edited and re-saved.
+    notesOverride: q.importantNotes && q.importantNotes.length
+      ? q.importantNotes.filter(n=> n.key!=='clientNote' && n.key!=='maintenanceY1' && n.key!=='maintenanceRenewal' && n.key!=='year1MaintenanceRemark' && n.key!=='maintenanceNoteYear1' && n.key!=='maintenanceNoteYear2' && n.key!=='maintenanceNoteYear3' && !ANNUAL_COST_HIDDEN_NOTE_KEYS.has(n.key))
+      : null,
+    clientNote:'',
+    domainName: q.domainName,
+    // Editing an EXISTING quotation defaults to 'not_included' whenever the
+    // saved record has no `maintenance` object at all (created before this
+    // feature existed), so opening it for editing never silently adds new
+    // maintenance terms it never had (spec §16). Compare defaultMaintenanceState()
+    // above, used only for BRAND-NEW quotations.
+    maintenance: q.maintenance || { year1Mode:'not_included', year1Cost:0, year2Cost:0, year3Cost:0, year2DisplayMode:'estimated', year3DisplayMode:'estimated' },
+    // Annual Cost Breakdown (spec §D/§28): prefer the record's own stored
+    // model; a quotation saved before this feature existed gets one safely
+    // DERIVED from its legacy flat fields, never rewritten in the DB.
+    annualCost: resolvedAnnualCost(q),
+    showDetailedBreakdown: extractShowDetailedBreakdown(q.importantNotes),
+    year1Total: null, year2Total: q.year2Total, year3Total: q.year3Total,
+    paymentPreset: q.paymentPreset||'30/70', customStages:null,
+    quotationDate: asDuplicate ? todayLocalISO() : q.quotationDate,
+    validUntil: asDuplicate ? daysFromNow(quotationDefaults().validityDays) : q.validUntil,
+    demoLink: q.demoLink||'',
+    demoLinks: q.demoLinks ? [...q.demoLinks] : [],
+    editingId: asDuplicate ? null : q.id,
+  };
+}
+
+/* ---------------------------------------------------------------------- */
+/* Quotation detail / actions / status workflow                           */
+/* ---------------------------------------------------------------------- */
+
+function versionHistoryFor(q){
+  const chain = [];
+  let cur = q;
+  while(cur){
+    chain.unshift(cur);
+    cur = cur.previousVersionId ? DB.find('quotations', cur.previousVersionId) : null;
+  }
+  // also append any known newer versions
+  let next = DB.all('quotations').find(x=>x.previousVersionId===q.id);
+  let tail = [];
+  while(next){ tail.push(next); next = DB.all('quotations').find(x=>x.previousVersionId===next.id); }
+  return [...chain, ...tail];
+}
+
+function openQuotationDetailModal(id){
+  const q = DB.find('quotations', id);
+  if(!q){ toast('Quotation not found.', 'error'); return; }
+  const acts = activitiesFor(id);
+  const displayStatus = quotationDisplayStatus(q);
+  const history = versionHistoryFor(q);
+  const linkedProject = q.projectCode ? DB.find('projects', q.projectCode) : null;
+
+  const html = `
+    <div class="modal-head">
+      <div><h3>${q.quoteNumber}</h3><div class="text-muted" style="font-size:12px;margin-top:2px">${escapeHtml(q.clientName)}${q.businessName?' — '+escapeHtml(q.businessName):''} · v${q.version||1}</div></div>
+      <button class="modal-close" id="qdClose">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="flex-row" style="justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+        <div class="flex-row" style="gap:8px;flex-wrap:wrap">${statusBadge(displayStatus)}${q.approvalStatus?statusBadge(q.approvalStatus):''}</div>
+        <div class="flex-row" style="flex-wrap:wrap;gap:8px" id="qdActions"></div>
+      </div>
+      ${pricingNotesHtml({ reasons:q.reasons, priceIsTBC:q.priceIsTBC, finalPrice:q.year1Total })}
+
+      <div class="two-col" style="margin-top:14px">
+        <div>
+          ${infoRow('Client', q.clientName)}
+          ${infoRow('Business', q.businessName || '— (not provided)')}
+          ${infoRow('Industry', q.industry)}
+          ${infoRow('Package', q.packageName)}
+          ${infoRow('Project Code', q.projectCode||'—')}
+        </div>
+        <div>
+          ${infoRow('Assigned Sales', q.assignedSales)}
+          ${infoRow('Quotation Date', fmtDate(q.quotationDate))}
+          ${infoRow('Valid Until', fmtDate(q.validUntil))}
+          ${infoRow('Linked', q.projectCode ? 'Project '+q.projectCode : (q.leadId ? 'Lead '+q.leadId : 'Direct client (no lead)'))}
+        </div>
+      </div>
+
+      <div class="divider"></div>
+      <div class="section-title" style="font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px">Scope of Work</div>
+      <div class="table-wrap scroll-x">
+        <table class="data-table">
+          <thead><tr><th>Module</th><th>Item</th><th>Price</th></tr></thead>
+          <tbody>${(q.items||[]).map(it=>`<tr><td>${escapeHtml(it.module)}</td><td>${escapeHtml(it.name)}</td><td>${it.price===null||it.price===undefined?'TBC':moneyPrecise(it.price)}</td></tr>`).join('')}</tbody>
+        </table>
+      </div>
+
+      <div class="divider"></div>
+      <div class="two-col">
+        <div>
+          ${infoRow('Year 1 Total', q.priceIsTBC?'TBC':moneyPrecise(q.year1Total))}
+          ${infoRow('Year 2 Renewal', moneyPrecise(q.year2Total)+'/yr')}
+          ${infoRow('Year 3 Renewal', moneyPrecise(q.year3Total)+'/yr')}
+        </div>
+        <div>
+          ${infoRow('Discount', (q.discountPct||0)+'%')}
+          ${q.manualAdjustment ? infoRow('Price Adjustment', moneyPrecise(q.manualAdjustment.amount)+' — '+escapeHtml(q.manualAdjustment.reason)) : ''}
+        </div>
+      </div>
+
+      ${history.length>1 ? `
+      <div class="divider"></div>
+      <div class="section-title" style="font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px">Version History (${history.length})</div>
+      ${history.map(v=>`<div class="mini-row" style="cursor:pointer" data-hist="${v.id}"><div class="mini-main"><div class="mini-title">v${v.version} — ${v.quoteNumber}</div><div class="mini-sub">${fmtDateTime(v.createdAt)}</div></div><div class="mini-right">${statusBadge(v.id===q.id?displayStatus:v.status)}</div></div>`).join('')}
+      ` : ''}
+
+      ${linkedProject ? `<div class="divider"></div><div class="mini-row"><div class="mini-main"><div class="mini-title">Converted to Project ${linkedProject.id}</div></div></div>` : ''}
+
+      <div class="divider"></div>
+      <div class="section-title" style="font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px">Activity History (${acts.length})</div>
+      ${acts.length ? acts.map(a=>`<div class="mini-row"><div class="mini-main"><div class="mini-title"><b>${escapeHtml(a.userName)}</b> — ${escapeHtml(a.type)}</div><div class="mini-sub">${escapeHtml(a.description)}</div></div><div class="mini-right">${fmtDateTime(a.at)}</div></div>`).join('') : `<div class="empty-row">No activity yet.</div>`}
+    </div>
+    <div class="modal-foot"><button class="btn btn-secondary" id="qdClose2">Close</button></div>
+  `;
+
+  openModal(html, { large:true, onMount:(overlay)=>{
+    overlay.querySelector('#qdClose').onclick = closeModal;
+    overlay.querySelector('#qdClose2').onclick = closeModal;
+    overlay.querySelectorAll('[data-hist]').forEach(x=> x.onclick = ()=> openQuotationDetailModal(x.dataset.hist));
+
+    const actionsEl = overlay.querySelector('#qdActions');
+    const btns = [];
+    btns.push(`<button class="btn btn-outline btn-sm" id="qaPreview">Preview</button>`);
+    btns.push(`<button class="btn btn-outline btn-sm" id="qaPdf">Download PDF</button>`);
+
+    // Root-cause fix (BizWeb CRM -- Replace Founder Review with
+    // Configurable Package Add-On Pricing, 2026-10-02 approval): the
+    // entire Submit for Approval / Awaiting Approval / Approve workflow
+    // is removed. Draft always offers Mark as Sent directly, for every
+    // role -- markAsSent() itself still blocks (with a clear message)
+    // while any item is unpriced (req #7), so nothing can ship with a
+    // silent $0 in place of a real amount.
+    if(q.status==='Draft'){
+      btns.push(`<button class="btn btn-ghost btn-sm" id="qaEdit">Edit</button>`);
+      btns.push(`<button class="btn btn-primary btn-sm" id="qaSend">Mark as Sent</button>`);
+    }
+    if(q.status==='Approved'){
+      btns.push(`<button class="btn btn-primary btn-sm" id="qaSend">Mark as Sent</button>`);
+    }
+    if(q.status==='Sent'){
+      btns.push(`<button class="btn btn-ghost btn-sm" id="qaEdit">Edit (new revision)</button>`);
+      btns.push(`<button class="btn btn-primary btn-sm" id="qaAccept">Mark as Accepted</button>`);
+      btns.push(`<button class="btn btn-ghost btn-sm" id="qaReject2">Mark as Rejected</button>`);
+    }
+    if(q.status==='Accepted' && !linkedProject){
+      btns.push(`<button class="btn btn-primary btn-sm" id="qaConvert">Convert to Project</button>`);
+    }
+    actionsEl.innerHTML = btns.join('');
+
+    overlay.querySelector('#qaPreview').onclick = ()=> openQuotationPreview(q.id);
+    overlay.querySelector('#qaPdf').onclick = ()=> openQuotationPreview(q.id, true);
+    const editBtn = overlay.querySelector('#qaEdit');
+    // Edit mode gets the exact same unsaved-changes protection as a brand
+    // new quotation (spec: "Also protect edit mode") — arm the baseline
+    // against the freshly-loaded existing values BEFORE the first render,
+    // so simply opening Edit (no changes yet) is never itself "dirty", and
+    // nothing here overwrites the saved record unless the user explicitly
+    // saves (saveQuotationFromState only ever runs on an explicit Save
+    // click, never as a side effect of opening/closing this form).
+    if(editBtn) editBtn.onclick = ()=>{ QC_STATE = loadStateFromQuotation(q); QC_STATE.projectCode = q.projectCode; QC_TAB='edit'; qcArmDirtyTracking(); renderCreateQuotationModal(); };
+    const sendBtn = overlay.querySelector('#qaSend');
+    if(sendBtn) sendBtn.onclick = function(){ return runSave(this, ()=> markAsSent(q.id)); };
+    const reject2Btn = overlay.querySelector('#qaReject2');
+    if(reject2Btn) reject2Btn.onclick = ()=> openRejectQuotationModal(q.id);
+    const acceptBtn = overlay.querySelector('#qaAccept');
+    if(acceptBtn) acceptBtn.onclick = function(){ return runSave(this, ()=> markAsAccepted(q.id)); };
+    const convertBtn = overlay.querySelector('#qaConvert');
+    if(convertBtn) convertBtn.onclick = function(){ return runSave(this, ()=> convertQuotationToProject(q.id)); };
+  }});
+}
+
+async function markAsSent(id){
+  const q = DB.find('quotations', id);
+  if(q.priceIsTBC){
+    const unresolved = (q.items||[]).filter(it=> it.included!==false && (it.price===null||it.price===undefined)).map(it=>it.name);
+    toast(`Enter a price for: ${unresolved.join(', ')} — before marking this quotation as sent.`, 'error');
+    return;
+  }
+  q.status = 'Sent';
+  const savedSent = await DB.update('quotations', q);
+  if(!savedSent.ok){ saveFailed(savedSent); return; }
+  logActivity({ userName: CURRENT_USER.name, refType:'quotation', refId:q.id, refLabel:`${q.quoteNumber} — ${q.businessName||q.clientName}`,
+    type:'Quotation Sent', description:`${CURRENT_USER.name} sent quotation ${q.quoteNumber} / Year 1 Total: ${q.priceIsTBC?'TBC':moneyPrecise(q.year1Total)}`,
+    toValue:'Sent' });
+  toast('Quotation marked as sent.', 'success');
+  openQuotationDetailModal(id);
+  if(currentRoute()==='quotations'){ renderQuotSummaryCards(); renderQuotTable(); }
+}
+
+// Client-facing rejection only (Sent -> Rejected, the client declined) --
+// this is NOT the old Founder-approval reject, which no longer exists.
+function openRejectQuotationModal(id){
+  const q = DB.find('quotations', id);
+  const html = `
+    <div class="modal-head"><h3>Mark as Rejected</h3><button class="modal-close" id="frClose">&times;</button></div>
+    <div class="modal-body">
+      <p class="text-muted" style="margin-top:0;font-size:13px">${q.quoteNumber} — ${escapeHtml(q.businessName||q.clientName)}</p>
+      <div class="form-field"><label class="required">Reason</label><textarea id="fr_comment" placeholder='e.g. "Client declined — budget." or "Client chose another vendor."'></textarea></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-secondary" id="frCancel">Cancel</button>
+      <button class="btn btn-danger" id="frSave">Reject</button>
+    </div>
+  `;
+  openModal(html, { onMount:(overlay)=>{
+    overlay.querySelector('#frClose').onclick = closeModal;
+    overlay.querySelector('#frCancel').onclick = closeModal;
+    overlay.querySelector('#frSave').onclick = function(){ return runSave(this, async ()=>{
+      const comment = overlay.querySelector('#fr_comment').value.trim();
+      if(!comment){ toast('A reason is required.', 'error'); return; }
+      const previousStatus = q.status;
+      q.status = 'Rejected';
+      const savedRej = await DB.update('quotations', q);
+      if(!savedRej.ok){ saveFailed(savedRej); return; }
+      logActivity({ userName: CURRENT_USER.name, refType:'quotation', refId:q.id, refLabel:`${q.quoteNumber} — ${q.businessName||q.clientName}`,
+        type:'Quotation Rejected', description:`${CURRENT_USER.name} marked quotation ${q.quoteNumber} as Rejected.`,
+        fromValue: previousStatus, toValue:'Rejected', remark: comment });
+      closeModal();
+      toast('Saved.', 'success');
+      openQuotationDetailModal(id);
+      if(currentRoute()==='quotations'){ renderQuotSummaryCards(); renderQuotTable(); }
+    }); };
+  }});
+}
+
+/* ---------------------------------------------------------------------- */
+/* Accepted -> Convert to Project                                         */
+/* ---------------------------------------------------------------------- */
+
+async function markAsAccepted(id){
+  const q = DB.find('quotations', id);
+  q.status = 'Accepted';
+  const savedAcc = await DB.update('quotations', q);
+  if(!savedAcc.ok){ saveFailed(savedAcc); return; }
+  logActivity({ userName: CURRENT_USER.name, refType:'quotation', refId:q.id, refLabel:`${q.quoteNumber} — ${q.businessName||q.clientName}`,
+    type:'Quotation Accepted', description:`${CURRENT_USER.name} marked quotation ${q.quoteNumber} as Accepted. Value: ${moneyPrecise(q.year1Total)}.`,
+    toValue:'Accepted' });
+
+  const lead = q.leadId ? DB.find('leads', q.leadId) : null;
+  if(lead && lead.status!=='Confirmed'){
+    const prevStatus = lead.status;
+    lead.status = 'Confirmed';
+    lead.updatedAt = new Date().toISOString();
+    const savedLead = await DB.update('leads', lead);
+    if(!savedLead.ok){ try{ toast('The quotation was accepted, but the lead could not be set to Confirmed: ' + savedLead.userMessage, 'error'); }catch(e){} }
+    else logActivity({ userName: CURRENT_USER.name, refType:'lead', refId: lead.id, refLabel:`${lead.clientName} — ${lead.businessName}`,
+      type:'Status Changed', description:`${CURRENT_USER.name} changed status: ${prevStatus} → Confirmed`,
+      fromValue: prevStatus, toValue:'Confirmed', remark:`Quotation ${q.quoteNumber} accepted.` });
+  }
+  toast('Quotation accepted.', 'success');
+  openQuotationDetailModal(id);
+  if(currentRoute()==='quotations'){ renderQuotSummaryCards(); renderQuotTable(); }
+}
+
+async function convertQuotationToProject(id){
+  const q = DB.find('quotations', id);
+  const lead = q.leadId ? DB.find('leads', q.leadId) : null;
+  const linkedExisting = q.projectCode ? DB.find('projects', q.projectCode) : (lead && lead.projectCode ? DB.find('projects', lead.projectCode) : null);
+
+  // Conflict protection (global project-code integrity fix, C059/C060) --
+  // a matching Project row only counts as "already this quotation's
+  // project" when it's actually linked to the SAME lead (or has no lead at
+  // all, e.g. a Direct Project later attached to a quotation). A Project
+  // belonging to a genuinely different lead is a real conflict -- stop
+  // instead of silently treating it as reusable or generating another code.
+  if(linkedExisting && lead && linkedExisting.leadId && linkedExisting.leadId !== lead.id){
+    toast(`Project Code ${linkedExisting.id} is already used by a different project (${linkedExisting.businessName}). This quotation cannot be converted with a conflicting code — please resolve the Project Code first.`, 'error');
+    return;
+  }
+
+  const groups = {};
+  (q.items||[]).forEach(it=>{
+    if(!groups[it.module]) groups[it.module] = { id: fnId(), module: it.module, functions: [] };
+    groups[it.module].functions.push({ id: fnId(), name: it.name, status:'Confirmed' });
+  });
+
+  if(linkedExisting){
+    linkedExisting.confirmedValue = q.year1Total || linkedExisting.confirmedValue || 0;
+    linkedExisting.quotationRef = q.quoteNumber;
+    linkedExisting.functions = Object.values(groups);
+    const savedProj = await DB.update('projects', linkedExisting);
+    if(!savedProj.ok){ saveFailed(savedProj); return; }
+    q.projectCode = linkedExisting.id;
+    const savedQ2 = await DB.update('quotations', q);
+    if(!savedQ2.ok){ saveFailed(savedQ2); return; }
+    logActivity({ userName: CURRENT_USER.name, refType:'quotation', refId:q.id, refLabel:`${q.quoteNumber} — ${q.businessName||q.clientName}`,
+      type:'Quotation Converted to Project', description:`${CURRENT_USER.name} linked quotation ${q.quoteNumber} to existing project ${linkedExisting.id}.`, toValue: linkedExisting.id });
+    toast(`Linked to existing project ${linkedExisting.id}.`, 'success');
+    openQuotationDetailModal(id);
+    return;
+  }
+
+  const code = (lead && lead.projectCode) ? lead.projectCode : (q.projectCode || suggestNextProjectCode());
+  const made = await createProjectRecord({
+    code, lead, confirmedValue: q.year1Total || 0, depositPct:50,
+    overrides: {
+      clientName: q.clientName, businessName: q.businessName, phone: q.phone,
+      industry: q.industry, projectType: q.packageKey, assignedSales: q.assignedSales,
+      notes: `Created from quotation ${q.quoteNumber}.`,
+      functions: Object.values(groups),
+    }
+  });
+  if(!made.ok){ saveFailed(made); return; }
+  const proj = made.record;
+  proj.quotationRef = q.quoteNumber;
+
+  q.projectCode = proj.id;
+  const savedQ3 = await DB.update('quotations', q);
+  if(!savedQ3.ok){ try{ toast('The project was created, but the quotation could not be linked to it: ' + savedQ3.userMessage, 'error'); }catch(e){} }
+
+  logActivity({ userName: CURRENT_USER.name, refType:'quotation', refId:q.id, refLabel:`${q.quoteNumber} — ${q.businessName||q.clientName}`,
+    type:'Quotation Converted to Project', description:`${CURRENT_USER.name} converted quotation ${q.quoteNumber} to project ${proj.id}. Confirmed Value: ${moneyPrecise(proj.confirmedValue)}.`,
+    toValue: proj.id });
+  logActivity({ userName: CURRENT_USER.name, refType:'project', refId: proj.id, refLabel:`${proj.id} — ${proj.businessName}`,
+    type:'Project Created', description:`${CURRENT_USER.name} created project ${proj.id} from accepted quotation ${q.quoteNumber}. Confirmed Value: ${moneyPrecise(proj.confirmedValue)}.`,
+    toValue:'Confirmed', remark:`Functions copied from ${q.quoteNumber}.` });
+
+  toast(`Project ${proj.id} created from ${q.quoteNumber}.`, 'success');
+  closeModal();
+  if(typeof openProjectDetailModal==='function') openProjectDetailModal(proj.id);
+}
+
+/* ---------------------------------------------------------------------- */
+/* Branded bilingual A4 preview + PDF (browser print)                     */
+/* ---------------------------------------------------------------------- */
+
+// Adapts the live Create-Quotation form state into a preview-shaped object
+// (same shape as a saved quotation) so the preview renderer can be reused
+// for both the live edit-preview pane and the saved-quotation preview modal.
+function qcStateToPreviewQuotation(s, evalRes, schedule){
+  const svc = serviceByProjectType(s.packageKey);
+  const notesList = s.notesOverride || (s.packageKey ? (quotationDefaults().notes[quotationTypeForProjectType(s.packageKey)]||[]) : []);
+  const ac = normalizeAnnualCost(s.annualCost);
+  const year1Charge = qcAnnualYear1Charge(ac.year1);
+  const year1Total = evalRes.priceIsTBC ? null : Math.round((evalRes.finalPrice + year1Charge)*100)/100;
+  // Legacy-mirror fields (domainCost/domainIncluded/domainRenewalEstimate/
+  // year2Total/year3Total/maintenance) are still populated here too — see
+  // the big comment above defaultAnnualCostState() — purely so
+  // buildQuoteSections' existing Year 2/3 math keeps working unchanged for
+  // this preview the same way it does for a saved quotation.
+  const legacyMaintenance = {
+    year1Mode: ac.year1.maintenanceInclude ? 'paid' : 'not_included', year1Cost: ac.year1.maintenance,
+    year2Cost: ac.year2.maintenance, year3Cost: ac.year3.maintenance,
+    year2DisplayMode: ac.year2.displayMode, year3DisplayMode: ac.year3.displayMode,
+  };
+  const baseNotes = s.clientNote ? [...notesList, {key:'clientNote',title:'Client-Specific Note',text:s.clientNote}] : notesList;
+  return {
+    quoteNumber: s.packageKey ? qcQuoteNumberPreview() : 'BW-Q-PREVIEW',
+    clientName: s.clientName, businessName: s.businessName, industry: s.industry,
+    packageName: svc?svc.name:s.packageKey, packageKey: s.packageKey,
+    quotationType: s.packageKey ? quotationTypeForProjectType(s.packageKey) : 'website',
+    quotationDate: s.quotationDate, validUntil: s.validUntil, demoLink: s.demoLink, demoLinks: s.demoLinks||[],
+    items: s.items.filter(i=>i.included!==false),
+    exclusions: s.exclusions,
+    domainName: s.domainName,
+    domainCost: ac.year1.domain, domainIncluded: ac.year1.domainMode!=='separate', domainRenewalEstimate: ac.year2.domain,
+    year1Total, priceIsTBC: evalRes.priceIsTBC,
+    year2Total: ac.year2.domain + ac.year2.hosting, // combined figure, matches the legacy field's historical meaning
+    year3Total: ac.year3.domain + ac.year3.hosting,
+    maintenance: legacyMaintenance,
+    paymentSchedule: schedule,
+    importantNotes: [...baseNotes, ...annualCostHiddenNotes(ac, !!s.showDetailedBreakdown)],
+  };
+}
+
+function quotationTitleBlock(quotationType){
+  return quotationType==='system'
+    ? { khmer:'សំណើតម្លៃប្រព័ន្ធ', english:'SYSTEM QUOTATION' }
+    : { khmer:'សំណើតម្លៃគេហទំព័រ', english:'WEBSITE QUOTATION' };
+}
+
+// Two-line bilingual table label (Khmer on its own line so Noto Sans Khmer
+// gets the extra line-height it needs, English underneath) — used for every
+// row of the client-info table. See the .quote-doc-infotable th CSS for the
+// per-script font-family split.
+function bilingualLabel(khmer, english){
+  return `<span class="khmer-label">${khmer}</span><span class="en-label">${escapeHtml(english)}</span>`;
+}
+
+/* ---------------------------------------------------------------------- */
+/* A4 pagination engine (spec: "A4 preview must be real A4")               */
+/*                                                                          */
+/* One content model, one measuring pass, one packing algorithm — used for */
+/* the live Create/Edit preview, the standalone Preview/Print modal, AND   */
+/* what actually gets printed/saved as PDF. This is the single source of  */
+/* truth spec item 24 asks for: nothing here is duplicated per surface.    */
+/*                                                                          */
+/* Pipeline:                                                                */
+/*   buildQuoteSections(q)      — PURE. Turns a quotation into an ordered  */
+/*                                 list of section descriptors (blocks that */
+/*                                 must never be split, and "groups" like   */
+/*                                 tables/lists that CAN split by row/item, */
+/*                                 repeating their header when they do).    */
+/*   measureQuoteDoc(...)       — the only DOM-touching step. Renders every */
+/*                                 section once in a hidden A4-width host   */
+/*                                 and reads back real pixel heights.       */
+/*   packQuoteSections(...)     — PURE. Greedy bin-packing of the measured  */
+/*                                 sections into pages, never splitting a   */
+/*                                 row/list-item, always keeping a repeated */
+/*                                 table header with the rows that follow.  */
+/*   renderQuotePagesHtml(...)  — PURE. Wraps packed page bodies in real    */
+/*                                 210mm×297mm .quote-page containers with  */
+/*                                 a full header on page 1 and a condensed  */
+/*                                 continuation header + "Page N of M"      */
+/*                                 footer on every page.                    */
+/*   buildQuotePagesHtml(q)     — orchestrates the four steps above.        */
+/*   paintQuotePreview(...)     — renders into a container, on screen.      */
+/*   printQuoteDocFromContainer — prints EXACTLY that already-rendered      */
+/*                                 DOM (see its own comment for why).       */
+/* ---------------------------------------------------------------------- */
+
+const QDOC_MM_TO_PX = 96/25.4;
+const QDOC_PAGE_W_MM = 210, QDOC_PAGE_H_MM = 297, QDOC_MARGIN_MM = 15;
+function qdocMm(n){ return n*QDOC_MM_TO_PX; }
+
+// Every row/list-item of the client-facing document, in document order.
+// `kind:'block'` = never split, never repeated (info table, domain note,
+// bank details, signature). `kind:'group'` = a heading + a repeatable-header
+// wrapper (a <table><thead>...</thead><tbody> or an <ol>) around a list of
+// items that CAN be split across pages — the packer repeats `headingHtml`/
+// `wrapOpenHtml` (which, for real tables, already contains the <thead> —
+// exactly what spec item 8 means by "repeat the table header") on every
+// page a group continues onto, and NEVER splits a single item's own html.
+function buildQuoteSections(q){
+  const bank = bankDetails();
+  const labels = yearCostLabels(q.quotationType);
+  const grouped = {};
+  (q.items||[]).forEach(it=>{ if(!grouped[it.module]) grouped[it.module]=[]; grouped[it.module].push(it); });
+
+  // NEW model (Annual Cost Breakdown) vs LEGACY quotation (spec §28): a
+  // quotation saved under the new consolidated Year 1/2/3 editor carries a
+  // hidden `__annualCost` note (see the big comment above
+  // defaultAnnualCostState in the state-init section) — everything below
+  // branches on its presence so an already-printed LEGACY document's
+  // numbers/wording never shift by even a cent; only quotations actually
+  // created/edited under the new model get the new Year 1 domain/hosting
+  // line-item wording and the Year 2/3 domain-inclusive total.
+  const storedAnnualCost = extractAnnualCost(q.importantNotes);
+  const usingNewModel = !!storedAnnualCost;
+  const showDetailed = usingNewModel && extractShowDetailedBreakdown(q.importantNotes);
+
+  // Maintenance-aware Year-by-Year Budget (spec §2/§3): the base
+  // year1/2/3 totals never absorb maintenance silently — a Year-1-paid
+  // maintenance add-on is shown as its own clearly-labeled line item, and
+  // Year 2/3 renewal + maintenance are broken out separately underneath the
+  // headline amount so it's always clear what the renewal consists of.
+  // `q.maintenance` (the legacy-mirror object) is NOT one of the columns
+  // actually persisted to Supabase (pre-existing, unrelated gap — out of
+  // scope here) — so for a NEW-model quotation, after a reload it can be
+  // undefined even though real Year 1/2/3 maintenance data exists. Derive
+  // `maint` from the reliably-persisted `storedAnnualCost` whenever
+  // possible; only fall back to `q.maintenance`/the hard default for a
+  // genuinely LEGACY record.
+  // `year1Mode`/`yearNCost` below are Include-GATED financial figures — the
+  // single source both the "& Maintenance" wording decision and the dollar
+  // math read from, for every year (see qcAnnualYearMaintenanceCharge, the
+  // one choke point normalizeAnnualCost's maintenanceInclude ultimately
+  // feeds). A year's maintenanceNote (enabled/type/text) never appears here
+  // — see maintenanceImportantNotes() below, its own fully independent path.
+  const maint = usingNewModel
+    ? { year1Mode: storedAnnualCost.year1.maintenanceInclude ? 'paid' : 'not_included', year1Cost: storedAnnualCost.year1.maintenance,
+        year2Cost: qcAnnualYearMaintenanceCharge(storedAnnualCost.year2), year3Cost: qcAnnualYearMaintenanceCharge(storedAnnualCost.year3),
+        year2DisplayMode: storedAnnualCost.year2.displayMode, year3DisplayMode: storedAnnualCost.year3.displayMode }
+    : (q.maintenance || { year1Mode:'not_included', year1Cost:0, year2Cost:0, year3Cost:0, year2DisplayMode:'estimated', year3DisplayMode:'estimated' });
+  const maintActive = maint.year1Mode && maint.year1Mode!=='not_included';
+  // Year 1 Budget line wording: append "& Maintenance" ONLY when a REAL
+  // financial Year 1 maintenance charge is actually included in the Year 1
+  // dollar amount (mode 'paid' with a genuinely non-zero cost) — never for
+  // Included/Free ($0) or remark-only maintenance, which have zero price
+  // impact and must never be implied as a paid line item here.
+  const y1MaintReal = maint.year1Mode==='paid' && (Number(maint.year1Cost)||0) > 0;
+  const mentionsMaintenance = (label)=> /maintenance/i.test(label);
+  let y1Label = (y1MaintReal && !mentionsMaintenance(labels.y1)) ? `${labels.y1} & Maintenance` : labels.y1;
+  let y2Label = (Number(maint.year2Cost)>0 && !mentionsMaintenance(labels.y2)) ? `${labels.y2} & Maintenance` : labels.y2;
+  let y3Label = (Number(maint.year3Cost)>0 && !mentionsMaintenance(labels.y3)) ? `${labels.y3} & Maintenance` : labels.y3;
+  const y1MaintAddOn = maint.year1Mode==='paid' ? (Number(maint.year1Cost)||0) : 0;
+  // LEGACY: q.year1Total never included Year 1 maintenance — add it here at
+  // display time (unchanged formula). NEW model: q.year1Total already IS
+  // the full chargeable total (development + domain + hosting +
+  // maintenance + add-ons − discount, spec §10) — adding y1MaintAddOn again
+  // would double-count it.
+  const y1Amount = q.priceIsTBC ? 'TBC' : moneyPrecise((Number(q.year1Total)||0) + (usingNewModel?0:y1MaintAddOn));
+  let y2Base, y2Maint, y3Base, y3Maint, y2Amount, y3Amount, y1Breakdown='', y2Breakdown='', y3Breakdown='';
+  if(usingNewModel){
+    const y1 = storedAnnualCost.year1, y2 = storedAnnualCost.year2, y3 = storedAnnualCost.year3;
+    y2Base = y2.domain + y2.hosting; y2Maint = qcAnnualYearMaintenanceCharge(y2);
+    y3Base = y3.domain + y3.hosting; y3Maint = qcAnnualYearMaintenanceCharge(y3);
+    y2Amount = qcYearAmountDisplay(y2Base + y2Maint, y2.displayMode||'estimated');
+    y3Amount = qcYearAmountDisplay(y3Base + y3Maint, y3.displayMode||'estimated');
+    // Year 1 domain wording (spec §4/§6/§23): Charged Separately shows its
+    // own dollar breakdown line; Client Own Domain says so explicitly
+    // (spec §26 TEST C — this exact phrase must appear); Included stays a
+    // single combined line (no change to y1Label).
+    if(y1.domainMode==='separate' && y1.domain>0 && !/domain/i.test(y1Label)) y1Label = `${y1Label} & Domain`;
+    const domainNameSuffix = q.domainName ? ` (${escapeHtml(q.domainName)})` : '';
+    if(y1.domainMode==='client_own'){
+      y1Breakdown = `<div class="text-muted" style="font-size:10.5px;margin-top:2px">Existing / client-owned domain${domainNameSuffix} — no domain cost charged.</div>`;
+    } else if(y1.domainMode==='separate' && y1.domain>0){
+      y1Breakdown = `<div class="text-muted" style="font-size:10.5px;margin-top:2px">Domain${domainNameSuffix} ${moneyPrecise(y1.domain)}</div>`;
+    } else if(q.domainName){
+      y1Breakdown = `<div class="text-muted" style="font-size:10.5px;margin-top:2px">Domain: ${escapeHtml(q.domainName)}</div>`;
+    }
+    if(showDetailed){
+      const y1Parts = [];
+      if(!y1.hostingIncluded && y1.hosting>0) y1Parts.push(`${hostingLabelForService(serviceByProjectType(q.packageKey))} ${moneyPrecise(y1.hosting)}`);
+      if(y1.maintenanceInclude && y1.maintenance>0) y1Parts.push(`Maintenance ${moneyPrecise(y1.maintenance)}`);
+      if(y1Parts.length) y1Breakdown += `<div class="text-muted" style="font-size:10.5px;margin-top:2px">${y1Parts.join(' / ')}</div>`;
+      y2Breakdown = `<div class="text-muted" style="font-size:10.5px;margin-top:2px">Domain ${moneyPrecise(y2.domain)} / Hosting ${moneyPrecise(y2.hosting)} / Maintenance ${moneyPrecise(y2Maint)}</div>`;
+      y3Breakdown = `<div class="text-muted" style="font-size:10.5px;margin-top:2px">Domain ${moneyPrecise(y3.domain)} / Hosting ${moneyPrecise(y3.hosting)} / Maintenance ${moneyPrecise(y3Maint)}</div>`;
+    }
+  } else {
+    y2Base = Number(q.year2Total)||0;
+    y2Maint = Number(maint.year2Cost)||0;
+    y3Base = Number(q.year3Total)||0;
+    y3Maint = Number(maint.year3Cost)||0;
+    y2Amount = q.year2Total!=null ? qcYearAmountDisplay(y2Base + y2Maint, maint.year2DisplayMode||'estimated') : 'TBC';
+    y3Amount = q.year3Total!=null ? qcYearAmountDisplay(y3Base + y3Maint, maint.year3DisplayMode||'estimated') : 'TBC';
+    y2Breakdown = (q.year2Total!=null && y2Maint>0) ? `<div class="text-muted" style="font-size:10.5px;margin-top:2px">Renewal ${moneyPrecise(y2Base)} + Maintenance ${moneyPrecise(y2Maint)}</div>` : '';
+    y3Breakdown = (q.year3Total!=null && y3Maint>0) ? `<div class="text-muted" style="font-size:10.5px;margin-top:2px">Renewal ${moneyPrecise(y3Base)} + Maintenance ${moneyPrecise(y3Maint)}</div>` : '';
+  }
+  const visibleExcl = visibleExclusions(q.items, q.exclusions);
+
+  const sections = [];
+
+  sections.push({ id:'info', kind:'block',
+    html:`<table class="quote-doc-infotable">${quoteInfoRows(q)}</table>` });
+
+  const moduleEntries = Object.entries(grouped);
+  sections.push({ id:'scope', kind:'group',
+    headingHtml:`<h4 class="quote-doc-h">Scope of Work</h4>`,
+    contHeadingHtml:`<h4 class="quote-doc-h">Scope of Work (continued)</h4>`,
+    wrapOpenHtml:'', wrapCloseHtml:'',
+    items: moduleEntries.length ? moduleEntries.map(([module,items])=>({
+      html:`<div class="quote-doc-scopegroup"><div class="quote-doc-scopegroup-title">${escapeHtml(module)}</div><ul class="quote-doc-scopegroup-list">${items.map(it=>`<li>${escapeHtml(it.name)}${it.price===null||it.price===undefined?' — TBC':''}</li>`).join('')}</ul></div>`
+    })) : [{ html:`<p class="text-muted" style="font-size:12.5px">Select a package to load scope.</p>` }],
+  });
+
+  sections.push({ id:'yearbudget', kind:'group',
+    headingHtml:`<h4 class="quote-doc-h">Year-by-Year Budget</h4>`,
+    contHeadingHtml:`<h4 class="quote-doc-h">Year-by-Year Budget (continued)</h4>`,
+    wrapOpenHtml:`<table class="quote-doc-table"><thead><tr><th>Year</th><th>Details</th><th>Amount</th></tr></thead><tbody>`,
+    wrapCloseHtml:`</tbody></table>`,
+    items:[
+      { html:`<tr><td>Year 1</td><td>${escapeHtml(y1Label)}${y1Breakdown}</td><td>${y1Amount}</td></tr>` },
+      { html:`<tr><td>Year 2</td><td>${escapeHtml(y2Label)}${y2Breakdown}</td><td>${y2Amount}</td></tr>` },
+      { html:`<tr><td>Year 3</td><td>${escapeHtml(y3Label)}${y3Breakdown}</td><td>${y3Amount}</td></tr>` },
+    ],
+  });
+
+  // The old standalone "Domain" block is folded into the Year 1 row above
+  // for any quotation created/edited under the new Annual Cost Breakdown
+  // (spec §9/§23 — one source of truth, no duplicate domain line). Kept
+  // exactly as before for a LEGACY quotation so its already-printed layout
+  // never shifts.
+  if(!usingNewModel && (q.domainName || q.domainCost!=null)){
+    sections.push({ id:'domain', kind:'block',
+      html:`<h4 class="quote-doc-h">Domain</h4><p style="font-size:12.5px;margin:0">${q.domainName?escapeHtml(q.domainName)+' — ':''}${q.domainIncluded?'included in Year 1':'not included'} (est. ${moneyPrecise(q.domainCost)}); renewal est. ${moneyPrecise(q.domainRenewalEstimate)}/year.</p>` });
+  }
+
+  const paymentFootNote = (!usingNewModel && maintActive && y1MaintAddOn>0) ? `<p class="text-muted" style="font-size:11px;margin:4px 0 0">Includes Year 1 maintenance (${moneyPrecise(y1MaintAddOn)}).</p>` : '';
+  sections.push({ id:'payment', kind:'group',
+    headingHtml:`<h4 class="quote-doc-h">Payment Schedule</h4>`,
+    contHeadingHtml:`<h4 class="quote-doc-h">Payment Schedule (continued)</h4>`,
+    wrapOpenHtml:`<table class="quote-doc-table qc-mini-table"><thead><tr><th>Stage</th><th>%</th><th>Amount</th></tr></thead><tbody>`,
+    wrapCloseHtml:`</tbody></table>${paymentFootNote}`,
+    items:(q.paymentSchedule||[]).map(st=>({ html:`<tr><td>${escapeHtml(st.label)}</td><td>${st.pct}%</td><td>${moneyPrecise(st.amount)}</td></tr>` })),
+  });
+
+  const noteItems = [];
+  visibleImportantNotes(q.importantNotes).forEach(n=> noteItems.push({ html:`<li><b>${escapeHtml(n.title)}:</b> ${escapeHtml(n.text)}</li>` }));
+  maintenanceWordingNotes(maint).forEach(n=> noteItems.push({ html:`<li><b>${escapeHtml(n.title)}:</b> ${escapeHtml(n.text)}</li>` }));
+  // Per-year Maintenance Note (informational, zero price impact) — the ONLY
+  // source of any maintenance-related Important Note now, one per Year 1/2/3
+  // (in that order) where that year's note is enabled. Only available on a
+  // new-model quotation (a LEGACY record never had this control, so it
+  // never gets a maintenance note either).
+  maintenanceImportantNotes(usingNewModel ? storedAnnualCost : null).forEach(n=> noteItems.push({ html:`<li><b>${escapeHtml(n.title)}:</b> ${escapeHtml(n.text)}</li>` }));
+  if(visibleExcl.length) noteItems.push({ html:`<li><b>Not Included:</b> ${visibleExcl.map(escapeHtml).join(', ')}.</li>` });
+  if(!noteItems.length) noteItems.push({ html:`<li>No additional notes.</li>` });
+  sections.push({ id:'notes', kind:'group',
+    headingHtml:`<h4 class="quote-doc-h">Important Notes</h4>`,
+    contHeadingHtml:`<h4 class="quote-doc-h">Important Notes (continued)</h4>`,
+    wrapOpenHtml:`<ol class="quote-doc-notes-list">`, wrapCloseHtml:`</ol>`,
+    items: noteItems,
+  });
+
+  // Two-column payment card: bank details on the left, KHQR on the right
+  // (stacks on narrow/mobile widths via the .quote-doc-bankbox CSS grid).
+  // Both halves + the heading travel together as one unit (kind:'block'),
+  // and .quote-doc-bankbox itself carries break-inside:avoid so the whole
+  // card is guaranteed never to split across a page — it either fits
+  // whole on the current page or flows entirely onto the next one.
+  const bankDetailRows = [
+    `<div><b>Account Name:</b> ${escapeHtml(bank.accountName)}</div>`,
+    `<div><b>Account Number:</b> ${escapeHtml(bank.accountNumber)}</div>`,
+    `<div><b>Bank Name:</b> ${escapeHtml(bank.bankName)}</div>`,
+    bank.memo ? `<div><b>Memo:</b> ${escapeHtml(bank.memo)}</div>` : '',
+  ].join('');
+  // width/height attributes corrected, not removed (2026-09-14 KHQR
+  // scanability fix): the old hardcoded width="180" height="180" matched
+  // neither the source image's real native size (570x555, not a perfect
+  // square) nor the frame's actual rendered box -- misleading metadata.
+  // Attributes are still required here (see .quote-doc-qr-frame in
+  // styles.css's own comment + khqr_payment_section_test.js): without
+  // them the <img> collapses to 0 height before it finishes loading,
+  // which the multi-page pagination measurement can read as a too-short
+  // section -- same fixed-dimensions trick already used for
+  // .quote-doc-logo. QR_FRAME_CONTENT_PX below matches
+  // .quote-doc-qr-frame's actual content-box size in styles.css
+  // (190px frame - 2x14px padding = 162px) so the hint is finally
+  // accurate instead of guessed; if that CSS frame size ever changes
+  // again, update this constant to match. The <img> still renders
+  // directly from the original source file with object-fit:contain
+  // (unchanged) -- no crop, no recompression, no canvas/base64 step,
+  // a single scale straight to the frame's box.
+  const QR_FRAME_CONTENT_PX = 162;
+  const qrHtml = bank.qrImageUrl ? `
+      <div class="quote-doc-qr-title">KHQR</div>
+      <div class="quote-doc-qr-frame"><img class="quote-doc-qr-img" src="${escapeHtml(bank.qrImageUrl)}" alt="KHQR Payment QR Code" width="${QR_FRAME_CONTENT_PX}" height="${QR_FRAME_CONTENT_PX}"></div>
+      <div class="quote-doc-qr-caption">Scan to Pay</div>
+      <div class="quote-doc-qr-help">Scan with your preferred banking app.</div>` : '';
+  sections.push({ id:'bank', kind:'block',
+    html:`<h4 class="quote-doc-h">Payment Bank Details</h4><div class="quote-doc-bankbox">
+      <div class="quote-doc-bankbox-details">
+        <div class="quote-doc-bankbox-label">Bank Details</div>
+        ${bankDetailRows}
+      </div>
+      ${qrHtml ? `<div class="quote-doc-bankbox-qr">${qrHtml}</div>` : ''}
+    </div>` });
+
+  sections.push({ id:'accept', kind:'block',
+    html:`<div class="quote-doc-accept">
+      <div class="quote-doc-accept-client">
+        <div class="sig-line"></div>
+        <span>Client Signature</span>
+      </div>
+      <div class="quote-doc-accept-rep">
+        <img class="quote-doc-accept-sig" src="../assets/signature/chhean-poli-signature.png" alt="Authorized Signature" width="194" height="68">
+        <div class="sig-line"></div>
+        <span>BizWeb KH Representative</span>
+      </div>
+    </div>` });
+
+  return sections;
+}
+
+// Business Name is OPTIONAL (spec §1): its row is simply omitted from the
+// client-facing document when blank — never shown empty, never silently
+// replaced with Client Name (that substitution only happens in internal,
+// non-client-facing labels like Activity Log entries — see the
+// `businessName||clientName` fallbacks used there, kept deliberately
+// separate from this function).
+function quoteInfoRows(q){
+  const rows = [
+    `<tr><th>${bilingualLabel('ឈ្មោះអតិថិជន','Client Name')}</th><td>${escapeHtml(q.clientName)}</td></tr>`,
+  ];
+  if(q.businessName && String(q.businessName).trim()){
+    rows.push(`<tr><th>${bilingualLabel('ឈ្មោះអាជីវកម្ម','Business Name')}</th><td>${escapeHtml(q.businessName)}</td></tr>`);
+  }
+  rows.push(`<tr><th>${bilingualLabel('គម្រោង','Project')}</th><td>${escapeHtml(q.packageName)}${q.industry?' — '+escapeHtml(q.industry):''}</td></tr>`);
+  rows.push(`<tr><th>${bilingualLabel('កាលបរិច្ឆេទ','Date')}</th><td>${fmtDate(q.quotationDate)}</td></tr>`);
+  rows.push(`<tr><th>${bilingualLabel('សុពលភាព','Valid Until')}</th><td>${fmtDate(q.validUntil)}</td></tr>`);
+  const demoLinks = [q.demoLink, ...(q.demoLinks||[])].map(x=>String(x||'').trim()).filter(Boolean);
+  if(demoLinks.length===1){
+    rows.push(`<tr><th>Demo Preview Link</th><td>${escapeHtml(demoLinks[0])}</td></tr>`);
+  } else if(demoLinks.length>1){
+    rows.push(`<tr><th>Demo Preview Links</th><td>${demoLinks.map((l,i)=>`${i+1}. ${escapeHtml(l)}`).join('<br>')}</td></tr>`);
+  }
+  return rows.join('');
+}
+
+function quoteFullHeaderHtml(q){
+  const title = quotationTitleBlock(q.quotationType);
+  return `<div class="quote-doc-head">
+    <div class="quote-doc-brand">
+      <img class="quote-doc-logo" src="../assets/branding/bizweb-kh-logo-main-print.png" alt="BizWeb KH">
+      <div class="text-muted" style="font-size:11px">Tel: 017 400 044 | Telegram: @BizWebKH | www.bizwebkh.com</div>
+    </div>
+    <div class="quote-doc-meta">
+      <div class="khmer-text" style="font-size:13px;color:var(--blue)">${title.khmer}</div>
+      <div><b>${title.english}</b></div>
+      <div>Quote No: ${escapeHtml(q.quoteNumber)}</div>
+    </div>
+  </div>`;
+}
+// Condensed continuation header (spec §10): every page after the first gets
+// a small "BizWeb KH — <type> · Quote No: X" line instead of the full
+// logo/header block, so page 2+ isn't wasting A4 real estate on a repeat of
+// the branding block while still always identifying which quotation/page a
+// loose printed sheet belongs to.
+function quoteContHeaderHtml(q){
+  const title = quotationTitleBlock(q.quotationType);
+  return `<div class="quote-doc-cont-head"><b>BizWeb KH</b> — ${escapeHtml(title.english)} · Quote No: ${escapeHtml(q.quoteNumber)}</div>`;
+}
+
+// Flat (non-paginated) concatenation of every section's full content — used
+// by automated tests to assert "nothing entered on the form is missing from
+// the document" (spec §6) without needing a real browser to measure/paginate.
+// Never used for actual rendering.
+function quoteSectionsPlainHtml(q){
+  const sections = buildQuoteSections(q);
+  return quoteFullHeaderHtml(q) + sections.map(sec=>{
+    if(sec.kind==='block') return sec.html;
+    return sec.headingHtml + sec.wrapOpenHtml + sec.items.map(i=>i.html).join('') + sec.wrapCloseHtml;
+  }).join('');
+}
+
+// The only DOM-touching step in the whole pipeline. Renders every block/
+// group once, at the real A4 content width, in a hidden host — and reads
+// back real pixel heights, so the exact same numbers a print engine would
+// use for A4 layout drive the on-screen page split too (spec §16).
+function measureQuoteDoc(sections, headerFullHtml, headerContHtml){
+  const host = document.createElement('div');
+  host.style.cssText = `position:fixed;left:-10000px;top:0;visibility:hidden;width:${QDOC_PAGE_W_MM - 2*QDOC_MARGIN_MM}mm;`;
+  host.className = 'quote-doc quote-doc-measure';
+  document.body.appendChild(host);
+
+  function measureHtml(html){
+    host.innerHTML = html;
+    return host.getBoundingClientRect().height;
+  }
+
+  const headerFullHeight = measureHtml(headerFullHtml);
+  const headerContHeight = measureHtml(headerContHtml);
+
+  const measured = sections.map(sec=>{
+    if(sec.kind==='block'){
+      return { ...sec, height: measureHtml(sec.html) };
+    }
+    const headingHeight = measureHtml(sec.headingHtml);
+    const contHeadingHeight = measureHtml(sec.contHeadingHtml);
+    const wrapOpenHeight = measureHtml(sec.wrapOpenHtml + sec.wrapCloseHtml);
+    // Measure every item's real height together, inside its actual wrapper,
+    // so table-row/list-item borders & padding come out exactly as they'll
+    // render on a page — tag each item's own outer tag so it can be read
+    // back individually after the whole group is rendered once.
+    host.innerHTML = sec.wrapOpenHtml + sec.items.map((it,i)=> it.html.replace(/^(<\w+)/, `$1 data-qi="${i}"`)).join('') + sec.wrapCloseHtml;
+    const items = sec.items.map((it,i)=>{
+      const el = host.querySelector(`[data-qi="${i}"]`);
+      return { html: it.html, height: el ? el.getBoundingClientRect().height : 0 };
+    });
+    return { ...sec, headingHeight, contHeadingHeight, wrapOpenHeight, wrapCloseHeight:0, items };
+  });
+
+  document.body.removeChild(host);
+  return { measured, headerFullHeight, headerContHeight };
+}
+
+// PURE greedy bin-packer: places measured sections into pages, never
+// splitting a plain block, never splitting a single group item, and always
+// re-emitting a group's heading (+ its repeatable wrapper, which for a real
+// table already contains the <thead> — spec §8) whenever that group
+// continues onto a new page. `firstBudget`/`contBudget` are the usable body
+// height (px) of page 1 (larger header) vs. every page after it (smaller
+// continuation header) — see buildQuotePagesHtml for how they're derived.
+function packQuoteSections(measured, opts){
+  const { firstBudget, contBudget } = opts;
+  const pages = [];
+  let curItems, curUsed, curBudget;
+  function startPage(){ curItems = []; curUsed = 0; curBudget = pages.length===0 ? firstBudget : contBudget; pages.push(curItems); }
+  function remaining(){ return curBudget - curUsed; }
+  function place(html, height){ curItems.push(html); curUsed += height; }
+  startPage();
+
+  for(const sec of measured){
+    if(sec.kind==='block'){
+      if(sec.height <= remaining() || curItems.length===0){
+        place(sec.html, sec.height);
+      } else {
+        startPage();
+        place(sec.html, sec.height);
+      }
+      continue;
+    }
+
+    const atomicHeight = sec.headingHeight + sec.wrapOpenHeight + sec.wrapCloseHeight + sec.items.reduce((s,i)=>s+i.height,0);
+    if(atomicHeight <= remaining()){
+      place(sec.headingHtml + sec.wrapOpenHtml + sec.items.map(i=>i.html).join('') + sec.wrapCloseHtml, atomicHeight);
+      continue;
+    }
+    // Doesn't fit in what's left of the current page — if the WHOLE group
+    // would fit cleanly on a fresh page, start one rather than splitting it
+    // unnecessarily (keeps short/typical quotations reading as clean,
+    // unsplit sections — splitting is reserved for genuinely long content).
+    // `splitFill` (opt-in, used by Invoices) skips this rule so a long table starts
+    // filling the CURRENT page and splits cleanly between rows instead of leaving a
+    // big empty area and jumping whole to the next page.
+    if(curItems.length>0 && atomicHeight <= contBudget && !sec.splitFill){
+      startPage();
+      place(sec.headingHtml + sec.wrapOpenHtml + sec.items.map(i=>i.html).join('') + sec.wrapCloseHtml, atomicHeight);
+      continue;
+    }
+
+    // Must split across pages — never mid-row/mid-item (spec §7/§8).
+    let idx = 0, usingCont = false;
+    while(idx < sec.items.length){
+      const headingHtml = usingCont ? sec.contHeadingHtml : sec.headingHtml;
+      const headingHeight = usingCont ? sec.contHeadingHeight : sec.headingHeight;
+      const overhead = headingHeight + sec.wrapOpenHeight + sec.wrapCloseHeight;
+      if(curItems.length>0 && remaining() < overhead + sec.items[idx].height){
+        startPage();
+      }
+      let segHeight = overhead;
+      const segItems = [];
+      while(idx < sec.items.length){
+        const it = sec.items[idx];
+        // Always place at least one item per page-segment (guarantees
+        // forward progress even if a single item is taller than a full
+        // page's budget) — otherwise only add more while they still fit.
+        if(segItems.length>0 && segHeight + it.height > remaining()) break;
+        segItems.push(it); segHeight += it.height; idx++;
+      }
+      place(headingHtml + sec.wrapOpenHtml + segItems.map(i=>i.html).join('') + sec.wrapCloseHtml, segHeight);
+      usingCont = true;
+      if(idx < sec.items.length) startPage();
+    }
+  }
+  return pages.map(items=>items.join(''));
+}
+
+function renderQuotePagesHtml(pageBodies, q, headerFullHtml, headerContHtml){
+  const total = pageBodies.length;
+  return pageBodies.map((body, i)=>{
+    const pageNum = i+1;
+    const header = i===0 ? headerFullHtml : `<div class="quote-page-cont-head-wrap">${headerContHtml}</div>`;
+    return `<div class="quote-doc quote-page" data-page="${pageNum}">
+      ${header}
+      <div class="quote-page-body">${body}</div>
+      <div class="quote-doc-footer">Page ${pageNum} of ${total}</div>
+    </div>`;
+  }).join('');
+}
+
+// Orchestrates the full pipeline for one quotation. Async only because it
+// waits for webfonts (Khmer) to finish loading before measuring — sizing
+// Khmer text with a fallback font's metrics would produce a page split that
+// stops matching reality the instant the real font swaps in.
+async function buildQuotePagesHtml(q){
+  try{ if(document.fonts && document.fonts.ready) await document.fonts.ready; }catch(e){}
+  const sections = buildQuoteSections(q);
+  const headerFullHtml = quoteFullHeaderHtml(q);
+  const headerContHtml = quoteContHeaderHtml(q);
+  const { measured, headerFullHeight, headerContHeight } = measureQuoteDoc(sections, headerFullHtml, headerContHtml);
+  const pageContentHeightPx = qdocMm(QDOC_PAGE_H_MM - 2*QDOC_MARGIN_MM);
+  const firstBudget = pageContentHeightPx - headerFullHeight;
+  const contBudget = pageContentHeightPx - headerContHeight;
+  const pages = packQuoteSections(measured, { firstBudget, contBudget });
+  const html = `<div class="quote-pages-wrap">${renderQuotePagesHtml(pages, q, headerFullHtml, headerContHtml)}</div>`;
+  return { html, pageCount: pages.length };
+}
+
+// Guards against a slower, now-stale render clobbering a faster, newer one
+// when the user edits several fields in quick succession (each edit kicks
+// off its own async buildQuotePagesHtml — only the LAST one requested
+// should ever reach the DOM).
+let QC_PREVIEW_TOKEN = 0;
+async function paintQuotePreview(containerEl, q, onDone){
+  const token = ++QC_PREVIEW_TOKEN;
+  const { html, pageCount } = await buildQuotePagesHtml(q);
+  if(token !== QC_PREVIEW_TOKEN) return; // superseded by a newer render
+  if(!containerEl || !document.body.contains(containerEl)) return; // modal closed meanwhile
+  containerEl.innerHTML = html;
+  if(onDone) onDone(pageCount);
+}
+
+// Prints EXACTLY the already-rendered `.quote-pages-wrap` the user is
+// looking at, by moving a copy of it to be a direct child of <body> and
+// hiding everything else for the duration of the print — never the old
+// "hide everything, show one flowing element inside the modal" trick.
+// That old approach depended on none of the modal's own ancestors clipping
+// or scroll-constraining the printed node (spec §17/§18's actual root
+// cause: `.modal-box` is a scrollable, height-capped container, so a print
+// target left nested inside it was never guaranteed to lay out at its full
+// natural height). Printing a dedicated body-level copy removes that
+// dependency entirely — nothing about the modal's own layout can clip it.
+function printQuoteDocFromContainer(containerEl){
+  const wrap = containerEl && containerEl.querySelector('.quote-pages-wrap');
+  if(!wrap){ toast('Preview is still rendering — please wait a moment and try again.', 'error'); return; }
+  const existing = document.getElementById('qcPrintRoot');
+  if(existing) existing.remove();
+  const root = document.createElement('div');
+  root.id = 'qcPrintRoot';
+  root.appendChild(wrap.cloneNode(true));
+  document.body.appendChild(root);
+  const cleanup = ()=>{
+    const el = document.getElementById('qcPrintRoot');
+    if(el) el.remove();
+    window.removeEventListener('afterprint', cleanup);
+  };
+  window.addEventListener('afterprint', cleanup);
+  // Fallback in case `afterprint` never fires (some "Save as PDF" flows).
+  setTimeout(cleanup, 20000);
+  printAfterFontsReady();
+}
+
+function openQuotationPreview(id, autoPrint=false){
+  const q = DB.find('quotations', id);
+  if(!q) return;
+  const html = `
+    <div class="modal-head"><h3>Quotation Preview</h3><span id="qpPageCount" class="text-muted" style="font-size:12px;margin-left:8px"></span><button class="modal-close" id="qpClose">&times;</button></div>
+    <div class="modal-body" style="background:#eef1f6;padding:20px" id="qpPreviewBody">
+      <div class="text-muted" style="padding:60px;text-align:center">Rendering preview…</div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-secondary" id="qpClose2">Close</button>
+      <button class="btn btn-primary" id="qpPrint" disabled>Download PDF (Print)</button>
+    </div>
+  `;
+  openModal(html, { large:true, onMount:(overlay)=>{
+    overlay.querySelector('#qpClose').onclick = closeModal;
+    overlay.querySelector('#qpClose2').onclick = closeModal;
+    const body = overlay.querySelector('#qpPreviewBody');
+    const printBtn = overlay.querySelector('#qpPrint');
+    printBtn.onclick = ()=> printQuoteDocFromContainer(body);
+    paintQuotePreview(body, q, (pageCount)=>{
+      if(!document.body.contains(overlay)) return;
+      const badge = overlay.querySelector('#qpPageCount');
+      if(badge) badge.textContent = `${pageCount} page${pageCount===1?'':'s'}`;
+      printBtn.disabled = false;
+      // Same font/paint-ready wait as the manual Print button — an
+      // auto-triggered print (the list page's PDF action) is exactly the
+      // case most likely to fire before the Khmer webfont/pagination has
+      // finished, which is why this now waits for the real page count
+      // instead of a blind setTimeout.
+      if(autoPrint) printQuoteDocFromContainer(body);
+    });
+  }});
+}
+
+/* ---------------------------------------------------------------------- */
+/* Small helper for embedding a linked-quotations list inside Lead /       */
+/* Project detail tabs (called from leads.js / projects.js)                */
+/* ---------------------------------------------------------------------- */
+
+function linkedQuotationsHtml(leadId, projectId){
+  const list = DB.all('quotations').filter(q=> q.status!=='Superseded' && ((leadId && q.leadId===leadId) || (projectId && q.projectCode===projectId)));
+  return `
+    <div class="flex-row" style="justify-content:space-between;margin-bottom:8px">
+      <div class="section-title" style="font-size:12.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin:0">Quotations</div>
+      <span class="cell-link" style="font-size:12px" data-new-quote="${leadId||''}|${projectId||''}">+ New Quotation</span>
+    </div>
+    ${list.length ? list.map(q=>`
+      <div class="mini-row" data-quote-row="${q.id}" style="cursor:pointer">
+        <div class="mini-main"><div class="mini-title">${q.quoteNumber}</div><div class="mini-sub">${q.priceIsTBC?'TBC':moneyPrecise(q.year1Total)} · ${escapeHtml(q.assignedSales)}</div></div>
+        <div class="mini-right">${statusBadge(quotationDisplayStatus(q))}</div>
+      </div>`).join('') : `<div class="empty-row">No quotations yet.</div>`}
+  `;
+}
+function wireLinkedQuotations(container){
+  container.querySelectorAll('[data-quote-row]').forEach(el=> el.onclick = ()=> openQuotationDetailModal(el.dataset.quoteRow));
+  const newBtn = container.querySelector('[data-new-quote]');
+  if(newBtn) newBtn.onclick = ()=>{
+    const [leadId, projectId] = newBtn.dataset.newQuote.split('|');
+    if(leadId) openCreateQuotationModal({ sourceType:'lead', leadId });
+    else openCreateQuotationModal({ sourceType:'new' });
+  };
+}

@@ -1,0 +1,1022 @@
+/* ==========================================================================
+   BizWeb KH CRM — pipeline.js
+   Kanban pipeline board with drag-and-drop; every drop triggers the shared
+   status-change confirmation modal before anything is committed.
+
+   Pipeline is now also the sales FOLLOW-UP workspace (the standalone
+   Follow-ups page was removed — see app.js currentRoute() and
+   followups.js). It reads/writes the exact same lead records as Lead
+   Records — no separate follow-up dataset is created or maintained here.
+   ========================================================================== */
+
+let PIPELINE_FILTER_STATE = { sales:'', industry:'', followup:'', search:'' };
+
+/* ---------------------------------------------------------------------- */
+/* Drag auto-scroll — native HTML5 drag-and-drop never auto-scrolls a      */
+/* custom scroll container (or the page) on its own, so a card near the    */
+/* bottom of a tall column, or a target stage several columns away, was    */
+/* unreachable while still holding the drag. This drives scrolling         */
+/* manually off the pointer position reported by 'dragover' events, via a  */
+/* requestAnimationFrame loop that only runs while a pcard drag is in      */
+/* progress. It does NOT touch overflow/CSS, lock scrolling, or change     */
+/* pipeline data — purely a drag-time scroll assist.                       */
+/* ---------------------------------------------------------------------- */
+const PIPELINE_DRAG_SCROLL = { active:false, x:0, y:0, raf:null };
+const DRAG_SCROLL_EDGE = 80;       // px from an edge that starts auto-scroll
+const DRAG_SCROLL_MAX_SPEED = 22;  // px per animation frame, right at the edge
+
+function pipelineDragScrollTick(){
+  if(!PIPELINE_DRAG_SCROLL.active){ PIPELINE_DRAG_SCROLL.raf = null; return; }
+  const board = document.getElementById('pipelineBoard');
+  const { x, y } = PIPELINE_DRAG_SCROLL;
+
+  // Horizontal — scroll the pipeline board itself so distant stages
+  // (far left/right) can be reached without releasing the card.
+  if(board){
+    const rect = board.getBoundingClientRect();
+    if(x < rect.left + DRAG_SCROLL_EDGE){
+      const strength = Math.min(1, (rect.left + DRAG_SCROLL_EDGE - x) / DRAG_SCROLL_EDGE);
+      board.scrollLeft -= DRAG_SCROLL_MAX_SPEED * strength;
+    } else if(x > rect.right - DRAG_SCROLL_EDGE){
+      const strength = Math.min(1, (x - (rect.right - DRAG_SCROLL_EDGE)) / DRAG_SCROLL_EDGE);
+      board.scrollLeft += DRAG_SCROLL_MAX_SPEED * strength;
+    }
+  }
+
+  // Vertical — the page itself scrolls (no dedicated vertical scroll
+  // container wraps the board), so this scrolls the window/viewport.
+  const vh = window.innerHeight;
+  if(y < DRAG_SCROLL_EDGE){
+    const strength = Math.min(1, (DRAG_SCROLL_EDGE - y) / DRAG_SCROLL_EDGE);
+    window.scrollBy(0, -DRAG_SCROLL_MAX_SPEED * strength);
+  } else if(y > vh - DRAG_SCROLL_EDGE){
+    const strength = Math.min(1, (y - (vh - DRAG_SCROLL_EDGE)) / DRAG_SCROLL_EDGE);
+    window.scrollBy(0, DRAG_SCROLL_MAX_SPEED * strength);
+  }
+
+  PIPELINE_DRAG_SCROLL.raf = requestAnimationFrame(pipelineDragScrollTick);
+}
+
+function startPipelineDragScroll(clientX, clientY){
+  PIPELINE_DRAG_SCROLL.x = clientX;
+  PIPELINE_DRAG_SCROLL.y = clientY;
+  if(PIPELINE_DRAG_SCROLL.active) return;
+  PIPELINE_DRAG_SCROLL.active = true;
+  if(!PIPELINE_DRAG_SCROLL.raf) PIPELINE_DRAG_SCROLL.raf = requestAnimationFrame(pipelineDragScrollTick);
+}
+
+function stopPipelineDragScroll(){
+  PIPELINE_DRAG_SCROLL.active = false;
+  if(PIPELINE_DRAG_SCROLL.raf){ cancelAnimationFrame(PIPELINE_DRAG_SCROLL.raf); PIPELINE_DRAG_SCROLL.raf = null; }
+}
+
+// One document-level 'dragover' listener tracks the live pointer position
+// while ANY pipeline card drag is in progress. Wired once (guarded by the
+// flag below) rather than inside renderPipelinePage(), so repeated
+// re-renders of the Pipeline page never stack up duplicate listeners. It
+// only records position — it never calls preventDefault(), so it can't
+// interfere with the existing per-column dragover/drop handling below.
+if(!window.__pipelineDragScrollWired){
+  window.__pipelineDragScrollWired = true;
+  document.addEventListener('dragover', (e)=>{
+    if(!PIPELINE_DRAG_SCROLL.active) return;
+    PIPELINE_DRAG_SCROLL.x = e.clientX;
+    PIPELINE_DRAG_SCROLL.y = e.clientY;
+  });
+}
+
+// Follow-up filter predicate. 'due' mirrors the Dashboard's "Follow-ups
+// Due" KPI exactly (overdue-or-today) — it exists as its own option so
+// clicking that KPI card opens Pipeline pre-filtered to precisely what it
+// counted (spec §9), not an approximation.
+function leadMatchesFollowupFilter(lead, filter){
+  if(!filter) return true;
+  if(filter==='none') return !lead.nextFollowup;
+  if(!lead.nextFollowup) return false;
+  if(filter==='due') return daysUntil(lead.nextFollowup) <= 0;
+  return urgencyOf(lead.nextFollowup) === filter;
+}
+
+// Pipeline search box (spec: "Add Search Function to Pipeline Tab") —
+// matches Client Name, Project/Business Name, and Project Code only,
+// case-insensitive, partial, trimmed. Reads the SAME lead objects already
+// loaded for the board (activeLeads()) — no separate dataset is created,
+// and no DB call is made per keystroke.
+function normalizePipelineSearch(s){ return (s||'').toLowerCase().trim(); }
+function leadMatchesPipelineSearch(l, nq){
+  if(!nq) return true;
+  if((l.clientName||'').toLowerCase().includes(nq)) return true;
+  if((l.businessName||'').toLowerCase().includes(nq)) return true;
+  if((l.projectCode||'').toLowerCase().includes(nq)) return true;
+  return false;
+}
+
+// Shared by the full page render and the search-only re-render below, so
+// the two can never drift out of sync. Sales / Industry / Follow-up
+// filters and the search box all narrow the SAME list together — none of
+// them resets another.
+function pipelineBoardLeads(){
+  const nq = normalizePipelineSearch(PIPELINE_FILTER_STATE.search);
+  return activeLeads().filter(l=>{
+    if(!PIPELINE_STATUSES.includes(l.status)) return false;
+    if(PIPELINE_FILTER_STATE.sales && l.assignedSales!==PIPELINE_FILTER_STATE.sales) return false;
+    if(PIPELINE_FILTER_STATE.industry && l.industry!==PIPELINE_FILTER_STATE.industry) return false;
+    if(!leadMatchesFollowupFilter(l, PIPELINE_FILTER_STATE.followup)) return false;
+    if(!leadMatchesPipelineSearch(l, nq)) return false;
+    return true;
+  });
+}
+
+function renderPipelinePage(){
+  const el = document.getElementById('pageContent');
+
+  // Preserve the user's current Pipeline viewport across this re-render —
+  // most importantly after a drag-and-drop status change, which used to
+  // rebuild the whole board and snap back to scrollLeft/scrollTop 0. This
+  // is captured from whatever is on screen RIGHT NOW (not some earlier
+  // "before the drag started" snapshot), so it naturally preserves
+  // wherever the drag auto-scroll left the viewport, and applies equally
+  // to a filter/counter-chip re-render (no reason those should jump the
+  // view back to the start either). Only fires when the Pipeline board is
+  // already on screen — a fresh navigation into Pipeline has nothing to
+  // preserve and just renders normally.
+  const prevBoard = document.getElementById('pipelineBoard');
+  const prevScrollLeft = prevBoard ? prevBoard.scrollLeft : 0;
+  const prevScrollTop = prevBoard ? window.scrollY : 0;
+
+  // Board columns respect Sales / Industry / Follow-up filters AND the
+  // search box together (see pipelineBoardLeads() above) — Confirmed
+  // leads normally have no outstanding follow-up (spec §12), so a
+  // Follow-up filter naturally shows few/no Confirmed cards, which is
+  // correct rather than something to special-case.
+  const boardLeads = pipelineBoardLeads();
+
+  // Follow-up counters (spec §8) — deliberately scoped to TRUE open
+  // opportunities (OPEN_PIPELINE_STATUSES, i.e. excluding Confirmed) so a
+  // Confirmed lead's now-irrelevant sales follow-up never inflates them
+  // (spec §12). Sales/Industry filters still narrow the counters, so the
+  // numbers always match what's actually visible on the board below.
+  // Deliberately NOT narrowed by the search box — these stay a stable
+  // "what's actually due" reference regardless of what's typed, same as
+  // before the search box existed.
+  const counterLeads = activeLeads().filter(l=>{
+    if(!OPEN_PIPELINE_STATUSES.includes(l.status)) return false;
+    if(PIPELINE_FILTER_STATE.sales && l.assignedSales!==PIPELINE_FILTER_STATE.sales) return false;
+    if(PIPELINE_FILTER_STATE.industry && l.industry!==PIPELINE_FILTER_STATE.industry) return false;
+    return true;
+  });
+  const overdueCount = counterLeads.filter(l=>urgencyOf(l.nextFollowup)==='overdue').length;
+  const todayCount = counterLeads.filter(l=>urgencyOf(l.nextFollowup)==='today').length;
+  const weekCount = counterLeads.filter(l=>['tomorrow','week'].includes(urgencyOf(l.nextFollowup))).length;
+
+  const salesList = [...new Set(activeLeads().map(l=>l.assignedSales).filter(Boolean))].sort();
+  const industryList = [...new Set(activeLeads().filter(l=>PIPELINE_STATUSES.includes(l.status)).map(l=>l.industry).filter(Boolean))].sort();
+
+  el.innerHTML = `
+    <div class="filters-bar">
+      ${isFounder() ? `<button class="btn btn-outline" id="pArchiveBtn" style="margin-right:4px">${icon('archive','width="15" height="15"')} Archive</button>` : ''}
+      <div class="search-box pipeline-search-box">
+        ${icon('search')}
+        <input type="text" id="pFltSearch" autocomplete="off" placeholder="Search client, project, or code..." value="${escapeHtml(PIPELINE_FILTER_STATE.search)}">
+        <button type="button" class="search-box-clear" id="pFltSearchClear" ${PIPELINE_FILTER_STATE.search?'':'hidden'} aria-label="Clear search">&times;</button>
+      </div>
+      <select id="pFltSales" class="sel">
+        <option value="">All Sales</option>
+        ${salesList.map(s=>`<option value="${escapeHtml(s)}" ${PIPELINE_FILTER_STATE.sales===s?'selected':''}>${escapeHtml(s)}</option>`).join('')}
+      </select>
+      <select id="pFltFollowup" class="sel">
+        <option value="">All Follow-ups</option>
+        <option value="overdue" ${PIPELINE_FILTER_STATE.followup==='overdue'?'selected':''}>Overdue</option>
+        <option value="today" ${PIPELINE_FILTER_STATE.followup==='today'?'selected':''}>Today</option>
+        <option value="tomorrow" ${PIPELINE_FILTER_STATE.followup==='tomorrow'?'selected':''}>Tomorrow</option>
+        <option value="week" ${PIPELINE_FILTER_STATE.followup==='week'?'selected':''}>This Week</option>
+        <option value="none" ${PIPELINE_FILTER_STATE.followup==='none'?'selected':''}>No Follow-up</option>
+      </select>
+      <select id="pFltIndustry" class="sel">
+        <option value="">All Industries</option>
+        ${industryList.map(s=>`<option value="${escapeHtml(s)}" ${PIPELINE_FILTER_STATE.industry===s?'selected':''}>${escapeHtml(industryLabel(s))}</option>`).join('')}
+      </select>
+      <div class="spacer"></div>
+      ${isFounder() ? `<button class="btn btn-primary" id="pAddToPipelineBtn">+ Add to Pipeline</button>` : ''}
+    </div>
+
+    <div class="flex-row followup-counters" style="gap:8px;flex-wrap:wrap;margin-bottom:14px">
+      <button type="button" class="fu-counter-chip chip-overdue ${PIPELINE_FILTER_STATE.followup==='overdue'?'active':''}" data-count-filter="overdue">Overdue <b>${overdueCount}</b></button>
+      <button type="button" class="fu-counter-chip chip-today ${PIPELINE_FILTER_STATE.followup==='today'?'active':''}" data-count-filter="today">Today <b>${todayCount}</b></button>
+      <button type="button" class="fu-counter-chip chip-week ${PIPELINE_FILTER_STATE.followup==='week'?'active':''}" data-count-filter="week">This Week <b>${weekCount}</b></button>
+      ${PIPELINE_FILTER_STATE.followup ? `<button type="button" class="fu-counter-chip chip-clear" data-count-filter="">Clear filter &times;</button>` : ''}
+      <div class="text-muted" style="font-size:11.5px;margin-left:4px">Drag a card to another column to move it through the pipeline. Every move requires confirmation and is logged.</div>
+    </div>
+
+    <div id="pSearchEmptyMsg" class="empty-row" style="display:${PIPELINE_FILTER_STATE.search.trim() && boardLeads.length===0 ? 'block':'none'};margin-bottom:14px">No matching pipeline records found.</div>
+
+    <div class="pipeline-board" id="pipelineBoard">
+      ${pipelineBoardColumnsHtml(boardLeads)}
+    </div>
+  `;
+
+  // Pipeline deliberately has no "+ Add Lead" button (spec §6/§9) — new
+  // leads are created in Lead Records only; Pipeline's own primary action
+  // is "+ Add to Pipeline", which selects an EXISTING lead.
+  const addToPipelineBtn = document.getElementById('pAddToPipelineBtn');
+  if(addToPipelineBtn) addToPipelineBtn.onclick = ()=> openAddToPipelineModal();
+  const archiveBtn = document.getElementById('pArchiveBtn');
+  if(archiveBtn) archiveBtn.onclick = ()=> openArchivedPipelineModal();
+  document.getElementById('pFltSales').onchange = (e)=>{ PIPELINE_FILTER_STATE.sales=e.target.value; renderPipelinePage(); };
+  document.getElementById('pFltFollowup').onchange = (e)=>{ PIPELINE_FILTER_STATE.followup=e.target.value; renderPipelinePage(); };
+  document.getElementById('pFltIndustry').onchange = (e)=>{ PIPELINE_FILTER_STATE.industry=e.target.value; renderPipelinePage(); };
+  el.querySelectorAll('[data-count-filter]').forEach(btn=>{
+    btn.onclick = ()=>{
+      const val = btn.dataset.countFilter;
+      PIPELINE_FILTER_STATE.followup = (PIPELINE_FILTER_STATE.followup===val) ? '' : val;
+      renderPipelinePage();
+    };
+  });
+
+  // Search box — updates on every keystroke, but deliberately re-renders
+  // ONLY the board/column contents (renderPipelineBoardOnly), never this
+  // filters-bar itself. A full renderPipelinePage() on every keystroke
+  // would rebuild this very <input>, killing focus and cursor position
+  // after each typed character — this keeps typing responsive and the
+  // field usable. Sales/Follow-up/Industry filters still use the full
+  // re-render above since a <select> onchange never has that focus
+  // problem.
+  const searchInput = document.getElementById('pFltSearch');
+  const searchClearBtn = document.getElementById('pFltSearchClear');
+  searchInput.oninput = (e)=>{
+    PIPELINE_FILTER_STATE.search = e.target.value;
+    searchClearBtn.hidden = !e.target.value;
+    renderPipelineBoardOnly();
+  };
+  searchClearBtn.onclick = ()=>{
+    PIPELINE_FILTER_STATE.search = '';
+    searchInput.value = '';
+    searchClearBtn.hidden = true;
+    searchInput.focus();
+    renderPipelineBoardOnly();
+  };
+
+  wirePipelineBoardInteractions();
+
+  // Restore the viewport captured above. Setting it right away covers the
+  // normal case (layout from the innerHTML assignment above is already
+  // committed by the time synchronous script resumes); the rAF pass is a
+  // second application as a safeguard against any layout that only
+  // settles on the next frame, so the restore always sticks rather than
+  // being silently overridden by the browser's own scroll handling.
+  if(prevBoard){
+    const newBoard = document.getElementById('pipelineBoard');
+    if(newBoard) newBoard.scrollLeft = prevScrollLeft;
+    window.scrollTo(0, prevScrollTop);
+    requestAnimationFrame(()=>{
+      const boardAgain = document.getElementById('pipelineBoard');
+      if(boardAgain) boardAgain.scrollLeft = prevScrollLeft;
+      window.scrollTo(0, prevScrollTop);
+    });
+  }
+}
+
+// Builds just the column markup (headers + cards) for the given, already-
+// filtered lead list — shared by the full page render above and the
+// search-only re-render below so the two can never drift apart.
+function pipelineBoardColumnsHtml(boardLeads){
+  return PIPELINE_STATUSES.map(st=>{
+    let cards = boardLeads.filter(l=>l.status===st);
+    // On Hold / Future Follow-up sorts nearest follow-up date first
+    // (spec §6) — a lead with no date at all (shouldn't normally
+    // happen, the status-change modal requires one) sorts to the end
+    // rather than crashing on an invalid Date comparison. Every other
+    // column keeps its normal (unsorted / natural DB) order — this is
+    // the one column where "what needs attention soonest" is the whole
+    // point of the view.
+    if(st===ON_HOLD_STATUS){
+      cards = [...cards].sort((a,b)=>{
+        if(!a.nextFollowup && !b.nextFollowup) return 0;
+        if(!a.nextFollowup) return 1;
+        if(!b.nextFollowup) return -1;
+        return new Date(a.nextFollowup) - new Date(b.nextFollowup);
+      });
+    }
+    const total = cards.reduce((s,l)=>s+(l.estimatedValue||0),0);
+    return `
+    <div class="pipeline-col" data-status="${st}">
+      <div class="pipeline-col-head">
+        <div>
+          <div class="col-title">${escapeHtml(pipelineStageLabel(st))}</div>
+          <div class="text-muted" style="font-size:10.5px;margin-top:2px">${moneyPrecise(total)}</div>
+        </div>
+        <div class="col-count">${cards.length}</div>
+      </div>
+      <div class="pipeline-cards" data-status="${st}">
+        ${cards.map(l=>pipelineCardHtml(l)).join('')}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// Search-only re-render: rebuilds ONLY #pipelineBoard's column markup (and
+// the "no matches" message) from the current filter+search state, leaving
+// the filters-bar — and critically the search <input> itself — untouched
+// in the DOM, so it never loses focus or cursor position while typing.
+// Re-wires drag/drop and click handlers on the freshly-built cards/columns
+// (the old ones were just discarded with the old innerHTML) and preserves
+// horizontal scroll position, exactly like the full-page render does.
+function renderPipelineBoardOnly(){
+  const board = document.getElementById('pipelineBoard');
+  if(!board) return;
+  const prevScrollLeft = board.scrollLeft;
+  const boardLeads = pipelineBoardLeads();
+
+  const emptyMsg = document.getElementById('pSearchEmptyMsg');
+  if(emptyMsg) emptyMsg.style.display = (PIPELINE_FILTER_STATE.search.trim() && boardLeads.length===0) ? 'block' : 'none';
+
+  board.innerHTML = pipelineBoardColumnsHtml(boardLeads);
+  board.scrollLeft = prevScrollLeft;
+  wirePipelineBoardInteractions();
+}
+
+// Card drag/drop/click + column drop-target wiring — shared by the full
+// page render and the search-only re-render above (both discard and
+// rebuild the card/column DOM, so both need to re-attach these every
+// time). Pulled out verbatim from the old renderPipelinePage() body; no
+// behavior change.
+function wirePipelineBoardInteractions(){
+  document.querySelectorAll('.pcard').forEach(card=>{
+    card.addEventListener('dragstart', (e)=>{
+      card.classList.add('dragging');
+      e.dataTransfer.setData('text/plain', card.dataset.leadId);
+      startPipelineDragScroll(e.clientX, e.clientY);
+    });
+    // dragend always fires after a drop (successful or not) and after a
+    // cancelled drag (Escape, dropped outside a valid target) alike, so
+    // this is the single place that reliably stops auto-scroll — no
+    // stuck/frozen scroll state is left behind either way (spec §7 TEST E).
+    card.addEventListener('dragend', ()=>{
+      card.classList.remove('dragging');
+      stopPipelineDragScroll();
+    });
+    card.addEventListener('click', ()=> openLeadDetailModal(card.dataset.leadId));
+  });
+
+  // Project Code edit icon (Founder/Admin only, see isFounder() gate in
+  // pipelineCardHtml) — must stop propagation so clicking it opens the
+  // small Edit Project Code modal instead of the card's own click handler
+  // opening the full Lead Detail modal underneath it.
+  document.querySelectorAll('[data-edit-code]').forEach(btn=>{
+    btn.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      const lead = DB.find('leads', btn.dataset.editCode);
+      if(lead) openEditProjectCodeModal(lead, ()=> renderPipelinePage());
+    });
+    // A draggable ancestor card intercepts mousedown for drag-start
+    // detection — without this, a click on the little edit icon can be
+    // swallowed as an aborted drag instead of registering as a click.
+    btn.addEventListener('mousedown', (e)=> e.stopPropagation());
+  });
+
+  document.querySelectorAll('.pipeline-col').forEach(col=>{
+    col.addEventListener('dragover', (e)=>{ e.preventDefault(); col.classList.add('drag-over'); });
+    col.addEventListener('dragleave', ()=> col.classList.remove('drag-over'));
+    col.addEventListener('drop', (e)=>{
+      e.preventDefault();
+      col.classList.remove('drag-over');
+      const leadId = e.dataTransfer.getData('text/plain');
+      const targetStatus = col.dataset.status;
+      const lead = DB.find('leads', leadId);
+      if(!lead || lead.status===targetStatus) return;
+      applyLeadStatusChange(lead, targetStatus);
+    });
+  });
+}
+
+function pipelineCardHtml(l){
+  // On Hold / Future Follow-up gets a small purple accent stripe (spec §2:
+  // a distinct non-red amber/purple accent) plus its note/reason shown
+  // right on the card, since that's the one column where "why is this
+  // paused and when do we revisit it" is the point of glancing at the
+  // board (spec §6).
+  const isOnHold = l.status === ON_HOLD_STATUS;
+  // Project Code becomes required from Quote and Demo Sent onward — the
+  // card shows it from that same point forward on the board, so it never
+  // disappears again once a lead moves past Quote and Demo Sent into
+  // Follow-up / On Hold / Negotiation / Confirmed. Deliberately NOT using
+  // leadStatusRequiresProjectCode() here: that function returns false for
+  // Confirmed (it has its own dedicated Confirm-Project flow, so it's
+  // excluded from the generic status-change gate), but a Confirmed card on
+  // the board should still visibly show the code it already has. Missing
+  // codes are shown, never hidden, so a Founder/Admin scanning the board
+  // can spot an old historical lead that still needs one.
+  const codeGateIdx = PIPELINE_STATUSES.indexOf(QUOTE_AND_DEMO_SENT_STATUS);
+  const showCode = PIPELINE_STATUSES.indexOf(l.status) >= codeGateIdx;
+  return `
+    <div class="pcard ${isOnHold?'pcard-onhold':''}" draggable="true" data-lead-id="${l.id}">
+      <div class="pcard-biz">${escapeHtml(l.businessName)}</div>
+      <div class="pcard-client">${escapeHtml(l.clientName)}</div>
+      ${showCode ? `
+      <div class="pcard-code-row">
+        <span class="pcard-code ${l.projectCode?'':'pcard-code-unset'}">Code: ${l.projectCode ? escapeHtml(l.projectCode) : 'Not Set'}</span>
+        ${isFounder() ? `<button type="button" class="pcard-code-edit" data-edit-code="${l.id}" title="Edit Project Code">${icon('edit','width="12" height="12"')}</button>` : ''}
+      </div>` : ''}
+      <span class="pcard-svc">${escapeHtml(serviceShortName(l.interestedService))}</span>
+      <div class="pcard-row">
+        <span class="pcard-value">${moneyPrecise(l.estimatedValue)}</span>
+        <div class="avatar-sm" style="background:${userColor(l.assignedSales)}" title="${escapeHtml(l.assignedSales)}">${userInitials(l.assignedSales)}</div>
+      </div>
+      <div class="pcard-row" style="margin-top:6px">
+        <span class="text-muted">Next:</span>
+        ${l.nextFollowup ? urgencyChip(l.nextFollowup) : '<span class="text-muted">—</span>'}
+      </div>
+      ${isOnHold && l.holdReason ? `<div class="pcard-note">${escapeHtml(l.holdReason)}</div>` : ''}
+    </div>
+  `;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Add to Pipeline — Founder/Admin only (sales-restructure task). Pipeline */
+/* now starts at Quote and Demo Sent; New Lead / Contacted / Qualified are */
+/* managed only in Lead Records. This is the one bridge between the two:  */
+/* it selects an EXISTING lead (never creates a new one), requires a      */
+/* unique Project Code, and advances that SAME lead straight to Quote and */
+/* Demo Sent via advanceLeadToPipeline() (leads.js). Reachable from the   */
+/* Pipeline page's own button, from a Qualified lead's row action in Lead */
+/* Records, and from that lead's own Detail modal (spec §12) — all three  */
+/* open this exact same modal.                                            */
+/* ---------------------------------------------------------------------- */
+function openAddToPipelineModal(opts={}){
+  if(!isFounder()){ toast('Only Founder/Admin can add a lead to Pipeline.', 'error'); return; }
+  const { preselectedLeadId=null, onDone=null } = opts;
+
+  // Eligibility (spec §4 default/recommended): Qualified leads only. A
+  // lead that has already been added to Pipeline is no longer Qualified
+  // (its status is already Quote and Demo Sent or later), so it is
+  // structurally excluded here — satisfying the duplicate-protection rule
+  // (spec §9) without any extra bookkeeping.
+  //
+  // IMPORTANT (root-cause fix — see renderResults() below): eligibleLeads()
+  // is used ONLY for the default list shown when the search box is empty,
+  // and for the final Confirm-time re-check. The SEARCH itself must query
+  // every live, non-archived lead (searchableLeads()) — not just the
+  // pre-filtered eligible ones — otherwise a real, existing Lead ID like
+  // L045 that happens to already be past Qualified (e.g. already in
+  // Pipeline, or still Contacted) is invisible to the search entirely and
+  // falls through to the generic "No qualified leads available" message,
+  // which is exactly the reported bug. Searching the full live dataset and
+  // then labelling each match by its actual status gives the user a
+  // truthful answer instead.
+  function eligibleLeads(){
+    return searchableLeads().filter(l=> l.status==='Qualified');
+  }
+  function searchableLeads(){
+    return DB.all('leads').filter(l=> !l.archived);
+  }
+
+  let selectedLead = preselectedLeadId ? DB.find('leads', preselectedLeadId) : null;
+  if(selectedLead && selectedLead.status !== 'Qualified'){
+    toast('This lead is already in the Pipeline.', 'error');
+    selectedLead = null;
+  }
+
+  const html = `
+    <div class="modal-head"><h3>Add to Pipeline</h3><button class="modal-close" id="atpClose">&times;</button></div>
+    <div class="modal-body">
+      <div class="form-field full" style="margin-bottom:14px">
+        <label class="required">Select Lead</label>
+        <div class="search-box" style="max-width:100%">
+          ${icon('search')}
+          <input type="text" id="atpSearch" autocomplete="off" placeholder="Search by Lead ID, client, business, phone, or service…">
+        </div>
+        <div id="atpResults" class="atp-dropdown" style="margin-top:8px;max-height:280px;overflow-y:auto;border:1px solid var(--line);border-radius:9px;box-shadow:0 8px 20px rgba(21,62,121,.08)"></div>
+        <div id="atpSelected" style="margin-top:8px"></div>
+      </div>
+      <div id="atpCodeWrap" style="display:none">
+        <div class="form-field">
+          <label class="required">Project Code</label>
+          <input id="atpCode" placeholder="e.g. C046" style="text-transform:uppercase">
+          <span class="form-hint">Must be unique across all leads and projects (not case-sensitive).</span>
+        </div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-secondary" id="atpCancel">Cancel</button>
+      <button class="btn btn-primary" id="atpConfirm" disabled>Confirm</button>
+    </div>
+  `;
+
+  openModal(html, { large:true, onMount:(overlay)=>{
+    overlay.querySelector('#atpClose').onclick = closeModal;
+    overlay.querySelector('#atpCancel').onclick = closeModal;
+
+    const resultsEl = overlay.querySelector('#atpResults');
+    const selectedEl = overlay.querySelector('#atpSelected');
+    const codeWrap = overlay.querySelector('#atpCodeWrap');
+    const codeInput = overlay.querySelector('#atpCode');
+    const confirmBtn = overlay.querySelector('#atpConfirm');
+
+    function renderSelected(){
+      if(!selectedLead){
+        selectedEl.innerHTML = '';
+        codeWrap.style.display = 'none';
+        confirmBtn.disabled = true;
+        return;
+      }
+      selectedEl.innerHTML = `
+        <div style="background:var(--surface-2);border:1px solid var(--line);border-radius:9px;padding:10px 12px;font-size:13px">
+          <div class="flex-row" style="justify-content:space-between">
+            <span class="cell-strong">${escapeHtml(selectedLead.id)} — ${escapeHtml(selectedLead.clientName)} (${escapeHtml(selectedLead.businessName)})</span>
+            <span class="cell-link" id="atpUnselect" style="font-size:12px">Change</span>
+          </div>
+          <div class="text-muted" style="margin-top:6px;font-size:12px">
+            Interested Service: ${escapeHtml(serviceDisplayName(selectedLead.interestedService))} · Est. Value: ${moneyPrecise(selectedLead.estimatedValue)}<br>
+            Assigned Sales: ${escapeHtml(selectedLead.assignedSales||'—')} · Current Status: ${statusBadge(selectedLead.status, pipelineStageLabel(selectedLead.status))}
+          </div>
+        </div>`;
+      overlay.querySelector('#atpUnselect').onclick = ()=>{ selectedLead=null; codeInput.value=''; renderSelected(); if(typeof renderResults==='function') renderResults(); };
+      codeWrap.style.display = 'block';
+      if(!codeInput.value) codeInput.value = suggestNextProjectCode();
+      confirmBtn.disabled = false;
+    }
+    renderSelected();
+
+    // Live autocomplete / typeahead — queries the SAME lead records shown
+    // in Lead Records (searchableLeads(), no separate list/database),
+    // responds on every keystroke (no Enter needed) AND on focus with an
+    // empty box (spec §1/§6), and shows every match regardless of
+    // eligibility (spec §3) rather than hiding non-Qualified leads. Only
+    // an actually-eligible (Qualified) row is clickable/selectable — every
+    // other match is still shown, clearly labelled "Already in Pipeline"
+    // or "Not Qualified Yet" (spec §4), so Founder/Admin can always
+    // confirm a real lead exists even when it can't be added right now.
+    // Case-insensitive, partial-match on Lead ID, Client Name, Business
+    // Name, Interested Service and (if already assigned) Project Code;
+    // phone matching strips all non-digit characters from both the query
+    // and the stored number first, so "012 587" still matches a phone
+    // stored without spaces.
+    function normalizeQuery(s){ return (s||'').toLowerCase().trim(); }
+    function digitsOnly(s){ return (s||'').replace(/\D/g,''); }
+    // Root-cause fix: a query is only eligible for the phone digit-substring
+    // match when it is ITSELF a "digits-ish" query (digits plus phone
+    // punctuation like spaces/dashes/parens/dots — e.g. "012 587", "034"),
+    // never when it contains letters (e.g. "L034"). Previously ANY query
+    // had its digits extracted and compared against every lead's phone
+    // number, so typing a Lead ID like "L034" got silently reduced to just
+    // "034" and matched against the PHONE NUMBER of any unrelated lead that
+    // happened to contain "034" anywhere in it (e.g. a phone number like
+    // 012 034 567) — producing exactly the reported symptom of random-
+    // looking unrelated leads (L012, L002, L015, ...) showing up for an
+    // ID search. Restricting the phone match to genuinely numeric queries
+    // keeps "034" -> phone/ID/project-code matching (spec §1) while an
+    // ID-shaped query like "L034" now ONLY matches id/project code/name/
+    // service — never phone.
+    function isDigitsQuery(s){ return /\d/.test(s) && /^[\d\s\-().]+$/.test(s); }
+    function matchesQuery(l, nq){
+      if(!nq) return true;
+      if(l.id.toLowerCase().includes(nq)) return true;
+      if(l.clientName.toLowerCase().includes(nq)) return true;
+      if(l.businessName.toLowerCase().includes(nq)) return true;
+      if((l.telegram||'').toLowerCase().includes(nq)) return true;
+      if((l.interestedService||'').toLowerCase().includes(nq)) return true;
+      if(l.interestedService && serviceDisplayName(l.interestedService).toLowerCase().includes(nq)) return true;
+      if(l.projectCode && l.projectCode.toLowerCase().includes(nq)) return true;
+      if(isDigitsQuery(nq)){
+        const qDigits = digitsOnly(nq);
+        if(qDigits && digitsOnly(l.phone).includes(qDigits)) return true;
+      }
+      return false;
+    }
+    const RESULT_LIMIT = 10; // spec §5 — "around 8–10 matches", scroll for more
+    function eligibilityPill(l){
+      if(l.status==='Qualified') return `<span class="atp-pill atp-pill-select">Select</span>`;
+      if(PIPELINE_STATUSES.includes(l.status)) return `<span class="atp-pill atp-pill-pipeline">Already in Pipeline</span>`;
+      // Lost gets its own honest label (spec §8) instead of the generic
+      // "Not Qualified Yet", which read oddly for a lead that was actively
+      // disqualified rather than simply not-there-yet — still non-
+      // selectable either way, no change to eligibility logic itself.
+      if(l.status==='Lost') return `<span class="atp-pill atp-pill-notqualified">Lost</span>`;
+      return `<span class="atp-pill atp-pill-notqualified">Not Qualified Yet</span>`;
+    }
+    function suggestionRowHtml(l){
+      const eligible = l.status === 'Qualified';
+      return `
+        <div class="mini-row atp-row${eligible?'':' atp-disabled'}"${eligible?` data-pick="${l.id}"`:''}>
+          <div class="mini-main">
+            <div class="mini-title">${l.id} — ${escapeHtml(l.businessName)}</div>
+            <div class="mini-sub">Client: ${escapeHtml(l.clientName)} · ${escapeHtml(l.interestedService?serviceDisplayName(l.interestedService):'—')}</div>
+            <div class="mini-sub" style="margin-top:3px">${statusBadge(l.status, pipelineStageLabel(l.status))}</div>
+          </div>
+          ${eligibilityPill(l)}
+        </div>`;
+    }
+    // Keyboard nav (spec §10): Arrow Down/Up move a highlighted row among
+    // the currently-rendered ELIGIBLE (selectable) rows only — disabled
+    // "Already in Pipeline"/"Not Qualified Yet" rows are shown but can't
+    // be keyboard-selected any more than they can be clicked. Enter picks
+    // whichever row is highlighted (defaulting to the first eligible row
+    // the moment results render, so Enter works immediately without
+    // pressing Down first). Escape closes the dropdown without clearing
+    // the typed query, matching standard autocomplete behavior.
+    let activeIndex = -1;
+    function pickRow(row){
+      selectedLead = DB.find('leads', row.dataset.pick);
+      resultsEl.innerHTML = ''; resultsEl.style.display = 'none';
+      overlay.querySelector('#atpSearch').value = '';
+      codeInput.value = '';
+      activeIndex = -1;
+      renderSelected();
+    }
+    function eligibleRows(){ return [...resultsEl.querySelectorAll('[data-pick]')]; }
+    function applyActiveHighlight(){
+      const rows = eligibleRows();
+      rows.forEach((r,i)=> r.classList.toggle('atp-active', i===activeIndex));
+      const active = rows[activeIndex];
+      if(active && typeof active.scrollIntoView === 'function') active.scrollIntoView({ block:'nearest' });
+    }
+    function wireResultRows(){
+      activeIndex = eligibleRows().length ? 0 : -1;
+      applyActiveHighlight();
+      eligibleRows().forEach(row=>{
+        row.onclick = ()=> pickRow(row);
+      });
+    }
+    function renderResults(){
+      resultsEl.style.display = 'block';
+      const nq = normalizeQuery(overlay.querySelector('#atpSearch').value);
+
+      if(!nq){
+        // Clicking/focusing the input with nothing typed → show eligible
+        // Qualified leads, newest first, rather than a blank box (spec §6).
+        const eligible = eligibleLeads().sort((a,b)=> new Date(b.createdAt||0) - new Date(a.createdAt||0));
+        if(eligible.length === 0){
+          resultsEl.innerHTML = `<div class="text-muted" style="padding:10px;font-size:12.5px">No qualified leads available to add to Pipeline.</div>`;
+          return;
+        }
+        resultsEl.innerHTML = eligible.slice(0,RESULT_LIMIT).map(suggestionRowHtml).join('');
+        wireResultRows();
+        return;
+      }
+
+      // Root-cause fix (still in effect): search the FULL live lead
+      // dataset (not just the pre-filtered eligible list) so a real lead
+      // like L045 is always found and truthfully labelled, even when it
+      // isn't eligible — this is what makes typing "L0" immediately show
+      // every L0xx lead regardless of status (spec §1/§2/§11).
+      const matches = searchableLeads().filter(l=>matchesQuery(l, nq)).slice(0,RESULT_LIMIT);
+      if(matches.length === 0){
+        resultsEl.innerHTML = `<div class="text-muted" style="padding:10px;font-size:12.5px">No matching Lead Record found.</div>`;
+        return;
+      }
+      resultsEl.innerHTML = matches.map(suggestionRowHtml).join('');
+      wireResultRows();
+    }
+    const searchInput = overlay.querySelector('#atpSearch');
+    searchInput.oninput = renderResults;
+    // Focusing the (possibly still-empty) field also opens the dropdown —
+    // a real typeahead shouldn't require typing first (spec §6).
+    searchInput.onfocus = renderResults;
+    searchInput.onkeydown = (e)=>{
+      if(resultsEl.style.display==='none' || !resultsEl.innerHTML) return;
+      const rows = eligibleRows();
+      if(e.key==='ArrowDown'){
+        e.preventDefault();
+        if(rows.length){ activeIndex = (activeIndex+1) % rows.length; applyActiveHighlight(); }
+      } else if(e.key==='ArrowUp'){
+        e.preventDefault();
+        if(rows.length){ activeIndex = (activeIndex-1+rows.length) % rows.length; applyActiveHighlight(); }
+      } else if(e.key==='Enter'){
+        e.preventDefault();
+        const row = rows[activeIndex] || rows[0];
+        if(row) pickRow(row);
+      } else if(e.key==='Escape'){
+        e.preventDefault();
+        resultsEl.innerHTML = ''; resultsEl.style.display = 'none';
+      }
+    };
+    // And show it immediately on modal open, instead of waiting for any
+    // interaction at all.
+    if(!selectedLead) renderResults();
+
+    confirmBtn.onclick = function(){ return runSave(this, async ()=>{
+      if(!selectedLead){ toast('Please select a lead.', 'error'); return; }
+      // Defense in depth against a race — the lead may have been advanced
+      // by someone else between opening this modal and clicking Confirm.
+      const fresh = DB.find('leads', selectedLead.id);
+      if(!fresh || fresh.status !== 'Qualified'){
+        toast('This lead is already in the Pipeline.', 'error');
+        selectedLead = null; renderSelected();
+        return;
+      }
+      const normalized = normalizeProjectCode(codeInput.value);
+      if(!normalized){
+        codeInput.style.borderColor='var(--red)';
+        toast('Project Code is required.', 'error');
+        return;
+      }
+      if(isProjectCodeTaken(normalized, { excludeLeadId: fresh.id })){
+        codeInput.style.borderColor='var(--red)';
+        toast(`Project Code ${normalized} is already in use.`, 'error');
+        return;
+      }
+      codeInput.style.borderColor='';
+      const adv = await advanceLeadToPipeline(fresh, normalized);
+      if(!adv || !adv.ok) return;       // failure already shown; the modal stays open with the typed code
+      toast(`${fresh.id} added to Pipeline as ${normalized}.`, 'success');
+      closeModal();
+      if(currentRoute()==='pipeline') renderPipelinePage();
+      if(currentRoute()==='leads') renderLeadsTable();
+      if(onDone) onDone();
+    }); };
+  }});
+}
+
+/* ---------------------------------------------------------------------- */
+/* Pipeline Archive view — Founder/Admin only. Shows archived SALES        */
+/* OPPORTUNITIES (leads that were actually in the Pipeline lifecycle) as   */
+/* a compact table, separate from Lead Records' own Active/Archived/All    */
+/* filter (which still lists every archived lead, early-stage included).   */
+/* Eligibility is deliberately "current status is a Pipeline stage OR a    */
+/* Project Code was ever assigned" rather than PIPELINE_STATUSES alone —   */
+/* the latter would silently miss a lead archived long ago whose status    */
+/* predates the sales-restructure task (e.g. still 'Qualified' from        */
+/* before Project Codes existed at that stage) but that already has a      */
+/* Project Code, i.e. genuinely was a pipeline opportunity. Restoring one   */
+/* of those falls back to Quote and Demo Sent (restoreLeadToPipeline, see  */
+/* leads.js) since its stale stage no longer exists on the board.          */
+/* Archiving a lead here NEVER touches its linked Project (if any) — a     */
+/* Confirmed opportunity's Project stays fully visible/untouched under      */
+/* Projects regardless of whether the Pipeline card itself is archived.    */
+/* ---------------------------------------------------------------------- */
+function archivedPipelineOpportunities(){
+  return DB.all('leads').filter(l=> l.archived && (PIPELINE_STATUSES.includes(l.status) || !!l.projectCode));
+}
+
+/* ---------------------------------------------------------------------- */
+/* Pipeline Archive — large management view (search, filters, sortable    */
+/* full-width table, pagination). State lives at module level (like       */
+/* LEADS_FILTER_STATE in leads.js) so it survives a Restore's reopen       */
+/* (openRestoreToPipelineModal's onDone calls openArchivedPipelineModal()  */
+/* again) without losing whatever the user had searched/filtered/sorted.  */
+/* ---------------------------------------------------------------------- */
+let PA_FILTER_STATE = { search:'', dateRange:'all', stage:'', sales:'', service:'', industry:'' };
+let PA_SORT = { field:'archivedAt', dir:'desc' };
+let PA_PAGE = 1;
+const PA_PAGE_SIZE = 20;
+
+function paMatchesSearch(l, nq){
+  if(!nq) return true;
+  if(l.id.toLowerCase().includes(nq)) return true;
+  if(l.projectCode && l.projectCode.toLowerCase().includes(nq)) return true;
+  if(l.clientName.toLowerCase().includes(nq)) return true;
+  if(l.businessName.toLowerCase().includes(nq)) return true;
+  if(l.interestedService){
+    if(l.interestedService.toLowerCase().includes(nq)) return true;
+    if(serviceDisplayName(l.interestedService).toLowerCase().includes(nq)) return true;
+  }
+  return false;
+}
+// Archived Date range filter — same "all/today/week/month" shape as Lead
+// Records' own date filter (leadMatchesDateRange), but keyed on
+// lead.archivedAt instead of createdAt.
+function paMatchesArchivedDateRange(l, range){
+  if(!range || range==='all') return true;
+  if(!l.archivedAt) return false;
+  const archived = new Date(l.archivedAt);
+  if(isNaN(archived)) return false;
+  const now = new Date();
+  if(range==='today') return archived.toDateString() === now.toDateString();
+  if(range==='week'){
+    const start = new Date(now); start.setHours(0,0,0,0); start.setDate(start.getDate() - start.getDay());
+    const end = new Date(start); end.setDate(end.getDate()+7);
+    return archived>=start && archived<end;
+  }
+  if(range==='month') return archived.getFullYear()===now.getFullYear() && archived.getMonth()===now.getMonth();
+  return true;
+}
+function paSortComparator(){
+  const { field, dir } = PA_SORT;
+  const mul = dir==='asc' ? 1 : -1;
+  return (a,b)=>{
+    let va, vb;
+    if(field==='clientName'){ va=(a.clientName||'').toLowerCase(); vb=(b.clientName||'').toLowerCase(); }
+    else if(field==='estimatedValue'){ va=Number(a.estimatedValue)||0; vb=Number(b.estimatedValue)||0; }
+    else if(field==='status'){ va=(a.status||'').toLowerCase(); vb=(b.status||'').toLowerCase(); }
+    else { va = a.archivedAt ? new Date(a.archivedAt).getTime() : 0; vb = b.archivedAt ? new Date(b.archivedAt).getTime() : 0; }
+    if(va<vb) return -1*mul;
+    if(va>vb) return 1*mul;
+    return 0;
+  };
+}
+function paFilteredSorted(){
+  const nq = PA_FILTER_STATE.search.trim().toLowerCase();
+  const items = archivedPipelineOpportunities().filter(l=>{
+    if(!paMatchesSearch(l, nq)) return false;
+    if(PA_FILTER_STATE.stage && l.status !== PA_FILTER_STATE.stage) return false;
+    if(PA_FILTER_STATE.sales && l.assignedSales !== PA_FILTER_STATE.sales) return false;
+    if(PA_FILTER_STATE.service && l.interestedService !== PA_FILTER_STATE.service) return false;
+    if(PA_FILTER_STATE.industry && l.industry !== PA_FILTER_STATE.industry) return false;
+    if(!paMatchesArchivedDateRange(l, PA_FILTER_STATE.dateRange)) return false;
+    return true;
+  });
+  items.sort(paSortComparator());
+  return items;
+}
+function paSortIndicator(field){
+  if(PA_SORT.field !== field) return '';
+  return ` <span class="sort-indicator">${PA_SORT.dir==='desc' ? '↓' : '↑'}</span>`;
+}
+
+function openArchivedPipelineModal(){
+  if(!isFounder()){ toast('Only Founder/Admin can view the Pipeline Archive.', 'error'); return; }
+  PA_PAGE = 1;
+  const allOpportunities = archivedPipelineOpportunities();
+  const html = `
+    <div class="modal-head"><h3>Pipeline Archive <span class="text-muted" style="font-size:12px;font-weight:600">(${allOpportunities.length})</span></h3><button class="modal-close" id="apClose">&times;</button></div>
+    <div class="modal-body" style="padding:0;display:flex;flex-direction:column;min-height:0;flex:1 1 auto">
+      <div style="padding:16px 22px 0">
+        <p class="text-muted" style="margin:0 0 14px;font-size:12.5px">View and manage archived opportunities.</p>
+        <div class="filters-bar" style="margin-bottom:14px">
+          <div class="search-box">
+            ${icon('search')}
+            <input type="text" id="paSearch" placeholder="Search Lead ID, Project Code, client, business, or service…" value="${escapeHtml(PA_FILTER_STATE.search)}">
+          </div>
+          <select id="paFltStage" class="sel" title="Last Pipeline Stage"><option value="">All Stages</option>${PIPELINE_STATUSES.map(s=>`<option value="${escapeHtml(s)}" ${PA_FILTER_STATE.stage===s?'selected':''}>${escapeHtml(pipelineStageLabel(s))}</option>`).join('')}</select>
+          <select id="paFltSales" class="sel" title="Sales Person"><option value="">All Sales</option>${salesOwnersList().map(s=>`<option ${PA_FILTER_STATE.sales===s?'selected':''}>${s}</option>`).join('')}</select>
+          <select id="paFltService" class="sel" title="Service"><option value="">All Services</option>${SERVICE_TYPES.map(s=>`<option value="${escapeHtml(s)}" ${PA_FILTER_STATE.service===s?'selected':''}>${escapeHtml(serviceDisplayName(s))}</option>`).join('')}</select>
+          <select id="paFltIndustry" class="sel" title="Industry"><option value="">All Industries</option>${INDUSTRIES.map(s=>`<option ${PA_FILTER_STATE.industry===s?'selected':''}>${s}</option>`).join('')}</select>
+          <select id="paFltDate" class="sel" title="Archived Date">
+            <option value="all" ${PA_FILTER_STATE.dateRange==='all'?'selected':''}>Any Archived Date</option>
+            <option value="today" ${PA_FILTER_STATE.dateRange==='today'?'selected':''}>Today</option>
+            <option value="week" ${PA_FILTER_STATE.dateRange==='week'?'selected':''}>This Week</option>
+            <option value="month" ${PA_FILTER_STATE.dateRange==='month'?'selected':''}>This Month</option>
+          </select>
+        </div>
+      </div>
+      <div id="paTableWrap" style="flex:1 1 auto;min-height:0;overflow-y:auto;padding:0 22px 6px"></div>
+    </div>
+    <div class="modal-foot"><button class="btn btn-secondary" id="apClose2">Close</button></div>
+  `;
+
+  openModal(html, { xl:true, onMount:(overlay)=>{
+    overlay.querySelector('#apClose').onclick = closeModal;
+    overlay.querySelector('#apClose2').onclick = closeModal;
+
+    const rerender = ()=>{ PA_PAGE = 1; renderPaTable(overlay); };
+    overlay.querySelector('#paSearch').oninput = (e)=>{ PA_FILTER_STATE.search = e.target.value; rerender(); };
+    overlay.querySelector('#paFltStage').onchange = (e)=>{ PA_FILTER_STATE.stage = e.target.value; rerender(); };
+    overlay.querySelector('#paFltSales').onchange = (e)=>{ PA_FILTER_STATE.sales = e.target.value; rerender(); };
+    overlay.querySelector('#paFltService').onchange = (e)=>{ PA_FILTER_STATE.service = e.target.value; rerender(); };
+    overlay.querySelector('#paFltIndustry').onchange = (e)=>{ PA_FILTER_STATE.industry = e.target.value; rerender(); };
+    overlay.querySelector('#paFltDate').onchange = (e)=>{ PA_FILTER_STATE.dateRange = e.target.value; rerender(); };
+
+    renderPaTable(overlay);
+  }});
+}
+
+function renderPaTable(overlay){
+  const wrap = overlay.querySelector('#paTableWrap');
+  const allFiltered = paFilteredSorted();
+  const totalPages = Math.max(1, Math.ceil(allFiltered.length / PA_PAGE_SIZE));
+  if(PA_PAGE > totalPages) PA_PAGE = totalPages;
+  if(PA_PAGE < 1) PA_PAGE = 1;
+  const startIdx = (PA_PAGE-1) * PA_PAGE_SIZE;
+  const pageItems = allFiltered.slice(startIdx, startIdx + PA_PAGE_SIZE);
+  const noRecordsAtAll = archivedPipelineOpportunities().length === 0;
+
+  function sortHeader(field, label){
+    return `<th class="th-sortable" data-sort="${field}" title="Click to sort">${label}${paSortIndicator(field)}</th>`;
+  }
+
+  wrap.innerHTML = noRecordsAtAll ? `
+    <div class="empty-row" style="padding:60px 18px">No archived opportunities yet.</div>
+  ` : `
+    <div class="table-wrap scroll-x">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Lead ID</th><th>Project Code</th>
+            ${sortHeader('clientName','Client')}
+            <th>Business</th><th>Service</th>
+            ${sortHeader('estimatedValue','Est. Value')}
+            ${sortHeader('status','Last Pipeline Stage')}
+            ${sortHeader('archivedAt','Archived Date')}
+            <th>Archived By</th><th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${pageItems.length ? pageItems.map(l=>`
+            <tr>
+              <td class="cell-link" data-view="${l.id}">${l.id}</td>
+              <td>${l.projectCode ? escapeHtml(l.projectCode) : '—'}</td>
+              <td class="cell-strong">${escapeHtml(l.clientName)}</td>
+              <td>${escapeHtml(l.businessName)}</td>
+              <td>${escapeHtml(l.interestedService?serviceDisplayName(l.interestedService):'—')}</td>
+              <td class="cell-strong">${moneyPrecise(l.estimatedValue)}</td>
+              <td>${statusBadge(l.status, pipelineStageLabel(l.status))}</td>
+              <td class="cell-nowrap">${l.archivedAt ? fmtDate(l.archivedAt) : '—'}</td>
+              <td>${escapeHtml(l.archivedBy||'—')}${l.archiveReason ? `<div class="cell-sub" title="${escapeHtml(l.archiveReason)}">${escapeHtml(l.archiveReason)}</div>` : ''}</td>
+              <td>
+                <div class="flex-row" style="gap:6px;flex-wrap:wrap">
+                  <button class="btn btn-secondary btn-sm" data-view="${l.id}">View</button>
+                  <button class="btn btn-primary btn-sm" data-restore="${l.id}">Restore</button>
+                  ${(!l.projectCode) ? `<button class="btn btn-danger btn-sm" data-delete="${l.id}">Delete</button>` : ''}
+                </div>
+              </td>
+            </tr>`).join('') : `<tr><td colspan="9"><div class="empty-row">No matching archived opportunities found.</div></td></tr>`}
+        </tbody>
+      </table>
+    </div>
+    ${renderPaPagination(allFiltered.length, totalPages)}
+  `;
+
+  wrap.querySelectorAll('[data-view]').forEach(el=>{
+    el.onclick = ()=>{ closeModal(); openLeadDetailModal(el.dataset.view); };
+  });
+  wrap.querySelectorAll('[data-restore]').forEach(btn=>{
+    btn.onclick = ()=>{
+      const lead = DB.find('leads', btn.dataset.restore);
+      if(!lead) return;
+      openRestoreToPipelineModal(lead, ()=> openArchivedPipelineModal());
+    };
+  });
+  // Permanent Delete (spec §6, optional) — only ever offered for a Founder/
+  // Admin AND only for a record with no linked Project Code, mirroring the
+  // exact eligibility openDeleteLeadModal() itself already enforces (spec
+  // §12: "do not change unrelated business logic" — this reuses that
+  // existing, unmodified permission/eligibility check rather than adding a
+  // new deletion path).
+  wrap.querySelectorAll('[data-delete]').forEach(btn=>{
+    btn.onclick = ()=>{
+      const lead = DB.find('leads', btn.dataset.delete);
+      if(!lead) return;
+      openDeleteLeadModal(lead);
+    };
+  });
+  wrap.querySelectorAll('[data-sort]').forEach(th=>{
+    th.onclick = ()=>{
+      const field = th.dataset.sort;
+      if(PA_SORT.field === field) PA_SORT.dir = PA_SORT.dir==='desc' ? 'asc' : 'desc';
+      else PA_SORT = { field, dir: field==='clientName' ? 'asc' : 'desc' };
+      renderPaTable(overlay);
+    };
+  });
+  wrap.querySelectorAll('[data-page]').forEach(btn=>{
+    btn.onclick = ()=>{
+      const p = btn.dataset.page;
+      if(p==='prev') PA_PAGE = Math.max(1, PA_PAGE-1);
+      else if(p==='next') PA_PAGE = Math.min(totalPages, PA_PAGE+1);
+      else PA_PAGE = Number(p);
+      renderPaTable(overlay);
+    };
+  });
+}
+
+function renderPaPagination(totalCount, totalPages){
+  if(totalCount===0) return '';
+  const startIdx = (PA_PAGE-1)*PA_PAGE_SIZE;
+  const shownFrom = startIdx+1;
+  const shownTo = Math.min(totalCount, startIdx+PA_PAGE_SIZE);
+  let pageBtns = '';
+  for(let p=1; p<=totalPages; p++){
+    if(totalPages>7 && p!==1 && p!==totalPages && Math.abs(p-PA_PAGE)>2){
+      if(p===2 || p===totalPages-1) pageBtns += `<span style="padding:0 4px;color:var(--muted)">…</span>`;
+      continue;
+    }
+    pageBtns += `<button class="btn ${p===PA_PAGE?'btn-primary':'btn-secondary'} btn-sm" data-page="${p}" style="min-width:34px">${p}</button>`;
+  }
+  return `
+    <div class="flex-row" style="justify-content:space-between;flex-wrap:wrap;gap:10px;margin:12px 0">
+      <p class="text-muted" style="margin:0;font-size:12px">Showing ${shownFrom}–${shownTo} of ${totalCount} archived opportunities</p>
+      <div class="flex-row" style="gap:6px">
+        <button class="btn btn-secondary btn-sm" data-page="prev" ${PA_PAGE<=1?'disabled':''}>Previous</button>
+        ${pageBtns}
+        <button class="btn btn-secondary btn-sm" data-page="next" ${PA_PAGE>=totalPages?'disabled':''}>Next</button>
+      </div>
+    </div>
+  `;
+}
+
+function openRestoreToPipelineModal(lead, onDone){
+  if(!isFounder()){ toast('Only Founder/Admin can restore an opportunity.', 'error'); return; }
+  const fallback = !PIPELINE_STATUSES.includes(lead.status);
+  const targetStage = fallback ? QUOTE_AND_DEMO_SENT_STATUS : lead.status;
+  const html = `
+    <div class="modal-head"><h3>Restore to Pipeline</h3><button class="modal-close" id="rpClose">&times;</button></div>
+    <div class="modal-body">
+      <p style="margin-top:0">Restore this opportunity to Pipeline?</p>
+      <p class="text-muted" style="font-size:12.5px">
+        <b>${escapeHtml(lead.clientName)} — ${escapeHtml(lead.businessName)}</b> (${lead.id}${lead.projectCode?' · Project '+escapeHtml(lead.projectCode):''}) will be restored to its last valid Pipeline stage: ${statusBadge(targetStage, pipelineStageLabel(targetStage))}
+        ${fallback ? `<br><span style="margin-top:4px;display:inline-block">Its previous stage (${escapeHtml(pipelineStageLabel(lead.status))}) no longer exists on the board, so it will fall back to ${escapeHtml(pipelineStageLabel(QUOTE_AND_DEMO_SENT_STATUS))}.</span>` : ''}
+      </p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-secondary" id="rpCancel">Cancel</button>
+      <button class="btn btn-primary" id="rpConfirm">Restore</button>
+    </div>
+  `;
+  openModal(html, { onMount:(overlay)=>{
+    overlay.querySelector('#rpClose').onclick = closeModal;
+    overlay.querySelector('#rpCancel').onclick = closeModal;
+    overlay.querySelector('#rpConfirm').onclick = ()=>{
+      closeModal();
+      restoreLeadToPipeline(lead, onDone);
+    };
+  }});
+}
